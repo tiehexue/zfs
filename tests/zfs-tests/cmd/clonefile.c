@@ -212,6 +212,7 @@ main(int argc, char **argv)
 
 	loff_t soff = 0, doff = 0;
 	size_t len = SSIZE_MAX;
+	unsigned long long len2;
 	if ((argc-optind) == 5) {
 		soff = strtoull(argv[optind+2], NULL, 10);
 		if (soff == ULLONG_MAX) {
@@ -227,11 +228,13 @@ main(int argc, char **argv)
 		    strcmp(argv[optind+4], "all") == 0) {
 			len = SSIZE_MAX;
 		} else {
-			len = strtoull(argv[optind+4], NULL, 10);
-			if (len == ULLONG_MAX) {
+			len2 = strtoull(argv[optind+4], NULL, 10);
+			if (len2 == ULLONG_MAX) {
 				fprintf(stderr, "invalid length");
 				return (1);
 			}
+			if (len2 < SSIZE_MAX)
+				len = (size_t)len2;
 		}
 	}
 
@@ -274,13 +277,9 @@ main(int argc, char **argv)
 		off_t slen = lseek(sfd, 0, SEEK_END);
 		off_t dpos = lseek(dfd, 0, SEEK_CUR);
 		off_t dlen = lseek(dfd, 0, SEEK_END);
-#ifdef __APPLE__
-		fprintf(stderr, "file offsets: src=%llu/%llu; dst=%llu/%llu\n",
-		    spos, slen, dpos, dlen);
-#else
-		fprintf(stderr, "file offsets: src=%lu/%lu; dst=%lu/%lu\n",
-		    spos, slen, dpos, dlen);
-#endif
+		fprintf(stderr, "file offsets: src=%jd/%jd; dst=%jd/%jd\n",
+		    (intmax_t)spos, (intmax_t)slen,
+		    (intmax_t)dpos, (intmax_t)dlen);
 	}
 
 	close(dfd);
@@ -342,7 +341,7 @@ do_copyfilerange(int sfd, int dfd, loff_t soff, loff_t doff, size_t len)
 	}
 	if (copied != len) {
 		fprintf(stderr, "copy_file_range: copied less than requested: "
-		    "requested=%lu; copied=%lu\n", len, copied);
+		    "requested=%zu; copied=%zd\n", len, copied);
 		return (1);
 	}
 	return (0);
