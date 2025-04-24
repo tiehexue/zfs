@@ -1211,3 +1211,5 @@ abd_raidz_rec_iterate(abd_t **cabds, abd_t **tabds,
 	}
 	abd_exit_critical(flags);
 }
+
+EXPORT_SYMBOL(abd_free);
