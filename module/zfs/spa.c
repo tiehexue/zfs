@@ -5908,7 +5908,7 @@ spa_open_common(const char *pool, spa_t **spapp, const void *tag,
 	}
 
 	if (firstopen)
-		zvol_create_minors_recursive(spa_name(spa));
+		zvol_create_minors(spa_name(spa));
 
 	*spapp = spa;
 
@@ -6888,7 +6888,7 @@ spa_import(char *pool, nvlist_t *config, nvlist_t *props, uint64_t flags)
 
 	mutex_exit(&spa_namespace_lock);
 
-	zvol_create_minors_recursive(pool);
+	zvol_create_minors(pool);
 
 	return (0);
 }
