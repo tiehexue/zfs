@@ -199,6 +199,8 @@ extern void spl_qsort(void *array, size_t nm, size_t member_size,
 
 void sysctl_os_init(void);
 void sysctl_os_fini(void);
+extern int vdev_disk_init(void);
+extern void vdev_disk_fini(void);
 
 /* See rant in vdev_file.c */
 #define	CLOSE_ON_UNMOUNT

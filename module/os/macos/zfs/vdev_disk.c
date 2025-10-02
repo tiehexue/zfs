@@ -55,8 +55,6 @@ _Atomic unsigned int spl_lowest_vdev_disk_stack_remaining = UINT_MAX;
 ldi_ident_t zfs_li;
 
 static void vdev_disk_close(vdev_t *);
-static int vdev_disk_init(spa_t *spa, nvlist_t *nv, void **tsd);
-static void vdev_disk_fini(vdev_t *vd);
 
 extern unsigned int spl_split_stack_below;
 
@@ -813,8 +811,8 @@ vdev_disk_rele(vdev_t *vd)
 }
 
 vdev_ops_t vdev_disk_ops = {
-	.vdev_op_init = vdev_disk_init,
-	.vdev_op_fini = vdev_disk_fini,
+	.vdev_op_init = NULL,
+	.vdev_op_fini = NULL,
 	.vdev_op_open = vdev_disk_open,
 	.vdev_op_close = vdev_disk_close,
 	.vdev_op_asize = vdev_default_asize,
@@ -837,8 +835,8 @@ vdev_ops_t vdev_disk_ops = {
 	.vdev_op_leaf = B_TRUE		/* leaf vdev */
 };
 
-static int
-vdev_disk_init(spa_t *spa, nvlist_t *nv, void **tsd)
+int
+vdev_disk_init()
 {
 
 	/*
@@ -940,14 +938,24 @@ vdev_disk_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	return (0);
 }
 
-static void
-vdev_disk_fini(vdev_t *vd)
+void
+vdev_disk_fini()
 {
-	taskq_destroy(vdev_disk_taskq_default);
-	taskq_destroy(vdev_disk_taskq_scrub);
-	taskq_destroy(vdev_disk_taskq_asyncr);
-	taskq_destroy(vdev_disk_taskq_asyncw);
-	taskq_destroy(vdev_disk_taskq_stack);
+	if (vdev_disk_taskq_default)
+		taskq_destroy(vdev_disk_taskq_default);
+	if (vdev_disk_taskq_scrub)
+		taskq_destroy(vdev_disk_taskq_scrub);
+	if (vdev_disk_taskq_asyncr)
+		taskq_destroy(vdev_disk_taskq_asyncr);
+	if (vdev_disk_taskq_asyncw)
+		taskq_destroy(vdev_disk_taskq_asyncw);
+	if (vdev_disk_taskq_stack)
+		taskq_destroy(vdev_disk_taskq_stack);
+	vdev_disk_taskq_default = NULL;
+	vdev_disk_taskq_scrub = NULL;
+	vdev_disk_taskq_asyncr = NULL;
+	vdev_disk_taskq_asyncw = NULL;
+	vdev_disk_taskq_stack = NULL;
 }
 
 /*
