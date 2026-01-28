@@ -45,12 +45,17 @@
 
 static uint32_t zvol_major = ZVOL_MAJOR;
 
-unsigned int zvol_request_sync = 0;
 unsigned int zvol_prefetch_bytes = (128 * 1024);
 unsigned long zvol_max_discard_blocks = 16384;
-unsigned int zvol_threads = 8;
 
-taskq_t *zvol_taskq;
+/*
+ * Is round-robin enough? We internally only spawn for
+ * IOKit deadlock avoidance, and low-stack situations,
+ * not performace in read/write.
+ */
+static volatile uint32_t zvol_os_rr;
+
+
 
 /* Until we can find a solution that works for us too */
 extern list_t zvol_state_list;
@@ -58,7 +63,7 @@ extern list_t zvol_state_list;
 extern unsigned int spl_split_stack_below;
 _Atomic unsigned int spl_lowest_zvol_stack_remaining = UINT_MAX;
 
-typedef struct zv_request {
+typedef struct zv_os_request {
 	zvol_state_t	*zv_zv;
 
 	union {
@@ -73,7 +78,7 @@ typedef struct zv_request {
 	kcondvar_t zv_cv;
 
 	taskq_ent_t	zv_ent;
-} zv_request_t;
+} zv_os_request_t;
 
 #define	ZVOL_LOCK_HELD		(1<<0)
 #define	ZVOL_LOCK_SPA		(1<<1)
@@ -82,31 +87,33 @@ typedef struct zv_request {
 static void
 zvol_os_spawn_cb(void *param)
 {
-	zv_request_t *zvr = (zv_request_t *)param;
+	zv_os_request_t *zvr = (zv_os_request_t *)param;
 	zvr->zv_func(zvr->zv_zv, zvr->zv_arg);
-	kmem_free(zvr, sizeof (zv_request_t));
+	kmem_free(zvr, sizeof (zv_os_request_t));
 }
 
 static void
 zvol_os_spawn(zvol_state_t *zv,
     void (*func)(zvol_state_t *, void *), void *arg)
 {
-	zv_request_t *zvr;
-	zvr = kmem_alloc(sizeof (zv_request_t), KM_SLEEP);
+	zv_os_request_t *zvr;
+	int tqid = atomic_inc_32_nv(&zvol_os_rr) % zvol_taskqs.tqs_cnt;
+
+	zvr = kmem_alloc(sizeof (zv_os_request_t), KM_SLEEP);
 	zvr->zv_zv = zv;
 	zvr->zv_arg = arg;
 	zvr->zv_func = func;
 
 	taskq_init_ent(&zvr->zv_ent);
 
-	taskq_dispatch_ent(zvol_taskq,
+	taskq_dispatch_ent(zvol_taskqs.tqs_taskq[tqid],
 	    zvol_os_spawn_cb, zvr, 0, &zvr->zv_ent);
 }
 
 static void
 zvol_os_spawn_wait_cb(void *param)
 {
-	zv_request_t *zvr = (zv_request_t *)param;
+	zv_os_request_t *zvr = (zv_os_request_t *)param;
 
 	zvr->zv_rv = zvr->zv_ifunc(zvr->zv_zv, zvr->zv_arg);
 
@@ -121,8 +128,10 @@ zvol_os_spawn_wait(zvol_state_t *zv,
     int (*func)(zvol_state_t *, void *), void *arg)
 {
 	int rv;
-	zv_request_t *zvr;
-	zvr = kmem_alloc(sizeof (zv_request_t), KM_SLEEP);
+	zv_os_request_t *zvr;
+	int tqid = atomic_inc_32_nv(&zvol_os_rr) % zvol_taskqs.tqs_cnt;
+
+	zvr = kmem_alloc(sizeof (zv_os_request_t), KM_SLEEP);
 	zvr->zv_zv = zv;
 	zvr->zv_arg = arg;
 	zvr->zv_ifunc = func;
@@ -133,7 +142,7 @@ zvol_os_spawn_wait(zvol_state_t *zv,
 
 	mutex_enter(&zvr->zv_lock);
 
-	taskq_dispatch_ent(zvol_taskq,
+	taskq_dispatch_ent(zvol_taskqs.tqs_taskq[tqid],
 	    zvol_os_spawn_wait_cb, zvr, 0, &zvr->zv_ent);
 
 	/* Make sure it ran, by waiting */
@@ -145,7 +154,7 @@ zvol_os_spawn_wait(zvol_state_t *zv,
 
 	VERIFY3P(zvr->zv_ifunc, ==, NULL);
 	rv = zvr->zv_rv;
-	kmem_free(zvr, sizeof (zv_request_t));
+	kmem_free(zvr, sizeof (zv_os_request_t));
 	return (rv);
 }
 
@@ -1123,23 +1132,13 @@ zvol_os_ioctl(dev_t dev, unsigned long cmd, caddr_t data, int isblk,
 int
 zvol_init(void)
 {
-	int threads = MIN(MAX(zvol_threads, 1), 1024);
-
-	zvol_taskq = taskq_create(ZVOL_DRIVER, threads, maxclsyspri-4,
-	    threads * 2, INT_MAX, TASKQ_PREPOPULATE);
-	if (zvol_taskq == NULL) {
-		return (-ENOMEM);
-	}
-
-	zvol_init_impl();
-	return (0);
+	return (zvol_init_impl());
 }
 
 void
 zvol_fini(void)
 {
 	zvol_fini_impl();
-	taskq_destroy(zvol_taskq);
 }
 
 
