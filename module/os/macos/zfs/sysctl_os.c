@@ -151,6 +151,7 @@ SYSCTL_NODE(_tunable, OID_AUTO, zfs_trim, CTLFLAG_RW, 0, "ZFS TRIM");
 SYSCTL_NODE(_tunable, OID_AUTO, zfs_txg, CTLFLAG_RW, 0, "ZFS transaction group");
 SYSCTL_NODE(_tunable, OID_AUTO, zfs_vdev, CTLFLAG_RW, 0, "ZFS VDEV");
 SYSCTL_NODE(_tunable, OID_AUTO, zfs_vnops, CTLFLAG_RW, 0, "ZFS VNOPS");
+SYSCTL_NODE(_tunable, OID_AUTO, zfs_vol, CTLFLAG_RW, 0, "ZFS VOLUME");
 SYSCTL_NODE(_tunable, OID_AUTO, zfs_zevent, CTLFLAG_RW, 0, "ZFS event");
 SYSCTL_NODE(_tunable, OID_AUTO, zfs_zil, CTLFLAG_RW, 0, "ZFS ZIL");
 SYSCTL_NODE(_tunable, OID_AUTO, zfs_zio, CTLFLAG_RW, 0, "ZFS ZIO");
@@ -196,6 +197,7 @@ void sysctl_os_init(void)
 	sysctl_register_oid(&sysctl__tunable_zfs_txg);
 	sysctl_register_oid(&sysctl__tunable_zfs_vdev);
 	sysctl_register_oid(&sysctl__tunable_zfs_vnops);
+	sysctl_register_oid(&sysctl__tunable_zfs_vol);
 	sysctl_register_oid(&sysctl__tunable_zfs_zevent);
 	sysctl_register_oid(&sysctl__tunable_zfs_zil);
 	sysctl_register_oid(&sysctl__tunable_zfs_zio);
@@ -214,6 +216,7 @@ void sysctl_os_fini(void)
 	sysctl_unregister_oid(&sysctl__tunable_zfs_zio);
 	sysctl_unregister_oid(&sysctl__tunable_zfs_zil);
 	sysctl_unregister_oid(&sysctl__tunable_zfs_zevent);
+	sysctl_unregister_oid(&sysctl__tunable_zfs_vol);
 	sysctl_unregister_oid(&sysctl__tunable_zfs_vnops);
 	sysctl_unregister_oid(&sysctl__tunable_zfs_vdev);
 	sysctl_unregister_oid(&sysctl__tunable_zfs_txg);
