@@ -25,6 +25,7 @@
 #include <os/macos/zfs/sys/zfs_ioctl_compat.h>
 #include <err.h>
 #include <libzfs_core.h>
+#include "libzfs_core_impl.h"
 
 static int
 zcmd_ioctl_compat(int fd, int request, zfs_cmd_t *zc, const int cflag)
@@ -78,7 +79,7 @@ zcmd_ioctl_compat(int fd, int request, zfs_cmd_t *zc, const int cflag)
  * and instead embed the error return value in the zc structure.
  */
 int
-lzc_ioctl_fd(int fd, unsigned long request, zfs_cmd_t *zc)
+lzc_ioctl_fd_os(int fd, unsigned long request, zfs_cmd_t *zc)
 {
 	size_t oldsize;
 	int ret, cflag = ZFS_CMD_COMPAT_NONE;
