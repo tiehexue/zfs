@@ -23,6 +23,6 @@
 #define	_LINUX_MODULE_H
 
 #include <libkern/libkern.h>
-#include <sys/mod_os.h>
+#include <sys/mod.h>
 
 #endif
