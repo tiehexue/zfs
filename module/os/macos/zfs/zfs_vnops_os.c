@@ -1737,9 +1737,7 @@ zfs_fsync(znode_t *zp, int syncflag, cred_t *cr)
 	    !vnode_isrecycled(ZTOV(zp))) {
 		if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
 			return (error);
-		atomic_inc_32(&zp->z_sync_writes_cnt);
 		zil_commit(zfsvfs->z_log, zp->z_id);
-		atomic_dec_32(&zp->z_sync_writes_cnt);
 		zfs_exit(zfsvfs, FTAG);
 	}
 
