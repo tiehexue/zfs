@@ -22,4 +22,9 @@
 #ifndef _SPL_SYS_MISC_H
 #define	_SPL_SYS_MISC_H
 
+/*
+ * Check if the current thread is a memory reclaim thread.
+ */
+extern int current_is_reclaim_thread(void);
+
 #endif /* SPL_SYS_MISC_H */

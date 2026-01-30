@@ -467,3 +467,13 @@ spl_set_thread_timeshare(thread_t thread,
 		    policy->timeshare, name);
 	}
 }
+
+/*
+ * Check if the current thread is a memory reclaim thread.
+ * Everything in XNU is secret.
+ */
+int
+current_is_reclaim_thread(void)
+{
+	return (0);
+}
