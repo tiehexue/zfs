@@ -794,9 +794,10 @@ static void zvol_os_rename_device_cb(zvol_state_t *zv, void *param)
 	zvolRenameDevice(zv);
 }
 
-void
+int
 zvol_os_rename_minor(zvol_state_t *zv, const char *newname)
 {
+	int error = 0;
 	// int readonly = get_disk_ro(zv->zv_zso->zvo_disk);
 
 	ASSERT(RW_LOCK_HELD(&zvol_state_lock));
@@ -823,6 +824,7 @@ zvol_os_rename_minor(zvol_state_t *zv, const char *newname)
 	 */
 	// set_disk_ro(zv->zv_zso->zvo_disk, !readonly);
 	// set_disk_ro(zv->zv_zso->zvo_disk, readonly);
+	return (error);
 }
 
 void
