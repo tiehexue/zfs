@@ -102,6 +102,10 @@ spl_assert(const char *buf, const char *file, const char *func, int line)
 #define	__maybe_unused	__attribute__((unused))
 #endif
 
+#ifndef __must_check
+#define	__must_check __attribute__((__warn_unused_result__))
+#endif
+
 /* BEGIN CSTYLED */
 #define	PANIC(fmt, a...)						\
 	spl_panic(__FILE__, __FUNCTION__, __LINE__, fmt, ## a)
