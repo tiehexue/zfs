@@ -86,6 +86,15 @@ extern int zfs_map(struct inode *ip, offset_t off, caddr_t *addrp,
     size_t len, unsigned long vm_flags);
 extern void zfs_zrele_async(znode_t *zp);
 
+/* async Direct I/O */
+struct kiocb;
+extern int zfs_read_async(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr,
+    struct kiocb *kiocb);
+extern int zfs_write_async(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr,
+    struct kiocb *kiocb);
+extern void zfs_async_dio_init(void);
+extern void zfs_async_dio_fini(void);
+
 #ifdef	__cplusplus
 }
 #endif
