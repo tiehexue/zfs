@@ -76,7 +76,7 @@ typeset datafile2="$(mktemp -t zvol_misc_dio_coher2.XXXXXX)"
 function cleanup
 {
 	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 0
+		set_tunable32 VOL_DIO_ENABLED 1
 		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
 	fi
 	rm -f "$datafile1" "$datafile2"
