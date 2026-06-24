@@ -166,9 +166,9 @@ int zvol_maxphys = DMU_MAX_ACCESS / 2;
  *
  * Default: 0 (disabled) for safety. Set to 1 to enable.
  */
-static int zvol_dio_enabled = 0;
+static int zvol_dio_enabled = 1;
 SYSCTL_INT(_vfs_zfs_vol, OID_AUTO, dio_enabled, CTLFLAG_RWTUN,
-	&zvol_dio_enabled, 0,
+	&zvol_dio_enabled, 1,
 	"Enable Direct I/O for zvols (bypass ARC, DMA directly to/from bio)");
 
 static void zvol_ensure_zilog(zvol_state_t *zv);
