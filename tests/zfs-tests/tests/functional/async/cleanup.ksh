@@ -21,7 +21,7 @@
 
 # Before pool teardown, ensure all async ZIO completions have fired.
 if tunable_exists ASYNC_DIO_ENABLED; then
-	set_tunable32 ASYNC_DIO_ENABLED 0 2>/dev/null
+	set_tunable32 ASYNC_DIO_ENABLED 1 2>/dev/null
 	# Sync only if pool exists (may not if setup failed)
 	zpool sync $TESTPOOL 2>/dev/null
 fi

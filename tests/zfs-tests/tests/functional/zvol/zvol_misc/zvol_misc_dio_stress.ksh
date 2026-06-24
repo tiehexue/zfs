@@ -64,7 +64,7 @@ typeset zvolsize=512M
 function cleanup
 {
 	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 0
+		set_tunable32 VOL_DIO_ENABLED 1
 		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
 	fi
 }

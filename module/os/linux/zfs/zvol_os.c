@@ -74,7 +74,7 @@ static boolean_t zvol_use_blk_mq = B_FALSE;
  *
  * Default: 0 (disabled) for safety. Set to 1 to enable.
  */
-static unsigned int zvol_dio_enabled = 0;
+static unsigned int zvol_dio_enabled = 1;
 
 /*
  * The maximum number of volblocksize blocks to process per thread.  Typically,

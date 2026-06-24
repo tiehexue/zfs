@@ -224,7 +224,7 @@ zpl_file_accessed(struct file *filp)
  *
  * Default: 0 (disabled)
  */
-static unsigned int zfs_async_dio_enabled = 0;
+static unsigned int zfs_async_dio_enabled = 1;
 
 #ifdef CONFIG_SYSFS
 module_param(zfs_async_dio_enabled, uint, 0644);
