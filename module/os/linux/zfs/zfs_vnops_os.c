@@ -4531,8 +4531,7 @@ MODULE_PARM_DESC(zfs_delete_blocks, "Delete files larger than N blocks async");
  * Reads:  pin user pages into an ABD → dmu_read_abd_async().
  *         The ABD is freed in the callback after DMA completes.
  *
- * Writes: copy user data into a kernel-linear ABD (avoids FOLL_LONGTERM
- *         pinning issues on RHEL/mainline ≥ 6.0) → dmu_write_abd_async().
+ * Writes: pin user pages into an ABD → dmu_write_abd_async().
  *         On ZIO completion, metadata updates and transaction commit run
  *         on system_taskq in process context.
  */
@@ -4855,7 +4854,7 @@ zfs_async_write_complete(void *arg, int error)
 }
 
 /*
- * Async Direct I/O write.  Copies user data into a kernel ABD, acquires
+ * Async Direct I/O write.  Pins user pages via zfs_setup_direct(), acquires
  * locks, creates a transaction, and dispatches writes via
  * dmu_write_abd_async().  The caller returns -EIOCBQUEUED to the VFS.
  *
@@ -4900,15 +4899,6 @@ zfs_write_async(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr,
 		return (SET_ERROR(EINVAL));
 	}
 
-	/*
-	 * Async Direct I/O writes copy user data into a kernel ABD
-	 * instead of pinning user pages via pin_user_pages_unlocked().
-	 * On RHEL kernels (and mainline >= 6.0), all pin_user_pages*()
-	 * variants implicitly add FOLL_LONGTERM which fails with ENOMEM
-	 * under concurrent I/O (iodepth=64 → 2048 concurrently held
-	 * pages).  Copying is safe on all kernel versions and the memcpy
-	 * cost is negligible compared to disk I/O latency.
-	 */
 	n = zfs_uio_resid(uio);
 	if (n == 0) {
 		zfs_exit(zfsvfs, FTAG);
@@ -4917,35 +4907,6 @@ zfs_write_async(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr,
 
 	n = P2ALIGN_TYPED(n, PAGE_SIZE, ssize_t);
 	if (n == 0) {
-		zfs_exit(zfsvfs, FTAG);
-		return (SET_ERROR(EOPNOTSUPP));
-	}
-
-	/*
-	 * Replicate all DIO eligibility checks from zfs_setup_direct().
-	 * Any condition that would skip DIO in the sync path returns
-	 * EOPNOTSUPP so the caller falls back to zfs_write().
-	 */
-	if (zfsvfs->z_os->os_direct == ZFS_DIRECT_ALWAYS)
-		ioflag |= O_DIRECT;
-
-	if (!zfs_dio_enabled ||
-	    zfsvfs->z_os->os_direct == ZFS_DIRECT_DISABLED) {
-		zfs_exit(zfsvfs, FTAG);
-		return (SET_ERROR(EOPNOTSUPP));
-	}
-
-	if (!zfs_uio_page_aligned(uio) ||
-	    !zfs_uio_aligned(uio, PAGE_SIZE)) {
-		if (zfs_dio_strict)
-			return (SET_ERROR(EINVAL));
-		zfs_exit(zfsvfs, FTAG);
-		return (SET_ERROR(EOPNOTSUPP));
-	}
-
-	if (n < zp->z_blksz ||
-	    zn_has_cached_data(zp, zfs_uio_offset(uio),
-	    zfs_uio_offset(uio) + n - 1)) {
 		zfs_exit(zfsvfs, FTAG);
 		return (SET_ERROR(EOPNOTSUPP));
 	}
@@ -4989,19 +4950,20 @@ zfs_write_async(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr,
 	}
 
 	/*
-	 * Copy user data into a kernel ABD.  This avoids the FOLL_LONGTERM
-	 * pinning issues that plague the pin_user_pages*() family across
-	 * RHEL/mainline kernel versions.
+	 * Pin user pages for Direct I/O and build an ABD from them.
 	 */
-	offset_t offset = zfs_uio_offset(uio);
-	abd_t *data = abd_alloc_linear(n, B_FALSE);
-	error = zfs_uiomove(abd_to_buf(data), n, UIO_WRITE, uio);
-	if (error) {
-		abd_free(data);
+	error = zfs_setup_direct(zp, uio, UIO_WRITE, &ioflag);
+	if (error != 0 || !(uio->uio_extflg & UIO_DIRECT)) {
 		zfs_rangelock_exit(lr);
 		zfs_exit(zfsvfs, FTAG);
-		return (error);
+		return (error != 0 ? error : SET_ERROR(EOPNOTSUPP));
 	}
+
+	offset_t offset = zfs_uio_offset(uio);
+	offset_t page_idx = (offset - zfs_uio_soffset(uio)) >> PAGESHIFT;
+	ASSERT3U(page_idx, <, uio->uio_dio.npages);
+	abd_t *data = abd_alloc_from_pages(&uio->uio_dio.pages[page_idx],
+	    offset & (PAGESIZE - 1), n);
 
 	boolean_t do_commit = (ioflag & (O_SYNC | O_DSYNC)) ||
 	    (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS);
@@ -5016,6 +4978,7 @@ zfs_write_async(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr,
 	if (error) {
 		dmu_tx_abort(tx);
 		abd_free(data);
+		zfs_uio_free_dio_pages(uio, UIO_WRITE);
 		zfs_rangelock_exit(lr);
 		zfs_exit(zfsvfs, FTAG);
 		return (error);
@@ -5032,9 +4995,9 @@ zfs_write_async(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr,
 	cb->zfsvfs = zfsvfs;
 	cb->lr = lr;
 	cb->uio = *uio;
-	cb->uio.uio_resid = 0;		/* all data already copied to ABD */
+	cb->uio.uio_resid = n;		/* DIO pages pinned, not yet written */
 	cb->start_resid = n;
-	cb->dio = B_FALSE;
+	cb->dio = B_TRUE;
 	cb->tag = FTAG;
 	cb->lock_idx = ((uint32_t)(uintptr_t)(curthread)) % RRM_NUM_LOCKS;
 	cb->data = data;
@@ -5065,6 +5028,7 @@ zfs_write_async(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr,
 	if (error) {
 		crfree(cr);
 		abd_free(data);
+		zfs_uio_free_dio_pages(uio, UIO_WRITE);
 		zfs_rangelock_exit(lr);
 		dmu_tx_abort(tx);
 		zfs_exit(zfsvfs, FTAG);
