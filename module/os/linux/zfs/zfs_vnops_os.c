@@ -4851,14 +4851,7 @@ zfs_async_write_complete(void *arg, int error)
 		cb->wrote = cb->start_resid - cb->uio.uio_resid;
 	cb->error = error;
 
-	taskqid_t tid = taskq_dispatch(system_taskq,
-	    zfs_async_write_task,
-	    cb, TQ_SLEEP);
-	if (tid == TASKQID_INVALID) {
-		/* Fallback: complete with error in current context */
-		cb->error = (error != 0) ? error : ENOMEM;
-		zfs_async_write_task(cb);
-	}
+	zfs_async_write_task(cb);
 }
 
 /*
