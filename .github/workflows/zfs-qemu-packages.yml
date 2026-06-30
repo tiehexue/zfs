@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ['ubuntu26', 'almalinux10', 'fedora44', 'debian13']
+        os: ['ubuntu26', 'almalinux10', 'fedora44', 'debian13', 'centos-stream10', 'freebsd15-1s']
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v6
@@ -131,10 +131,8 @@ jobs:
       with:
         name: ${{ matrix.os }}-repo
         path: ${{ matrix.os }}-repo.tar.bz2
-        compression-level: 0
         retention-days: 2
         if-no-files-found: ignore
-        archive: false
 
   combine_repos:
     if: always()
@@ -145,25 +143,37 @@ jobs:
     - uses: actions/download-artifact@v8
       id: artifact-download
       if: always()
-    - name: Test Summary
+    - name: Collect and prepare tarballs
       if: always()
       run: |
-        for i in $(find . -type f -iname "*.tar.bz2") ; do
-          tar -xf $i -C /tmp
-        done
-        tar -cjf all-repo.tar.bz2 -C /tmp repo
+        mkdir -p dist
 
-        # If we're installing from a repo, print out the summary of the versions
-        # that got installed using Markdown.
+        # The matrix jobs produce ${{ matrix.os }}-repo.tar.bz2 files.
+        # download-artifact puts each artifact in a subdirectory named
+        # after the artifact (e.g., ubuntu26-repo/ubuntu26-repo.tar.bz2).
+        shopt -s nullglob
+        for dir in *-repo/; do
+          os_name="${dir%-repo/}"
+          cp "$dir/${os_name}-repo.tar.bz2" "dist/${os_name}-repo.tar.bz2" || true
+        done
+        shopt -u nullglob
+
+        # If we're installing from a repo, extract all tarballs to print
+        # the summary of versions that got installed.
         if [ "${{ github.event.inputs.test_type }}" == "Test repo" ] ; then
-          cd /tmp/repo
-          for i in $(ls *.txt) ; do
-            nicename="$(echo $i | sed 's/.txt//g; s/-/ /g')"
-            echo "### $nicename" >> $GITHUB_STEP_SUMMARY
-            echo "|repo|RPM|URL|" >> $GITHUB_STEP_SUMMARY
-            echo "|:---|:---|:---|" >> $GITHUB_STEP_SUMMARY
-            awk '{print "|"$1"|"$2"|"$3"|"}' $i >> $GITHUB_STEP_SUMMARY
+          for i in dist/*.tar.bz2 ; do
+            tar -xf "$i" -C /tmp
           done
+          if ls /tmp/repo/*.txt &>/dev/null; then
+            cd /tmp/repo
+            for i in *.txt ; do
+              nicename="$(echo $i | sed 's/.txt//g; s/-/ /g')"
+              echo "### $nicename" >> $GITHUB_STEP_SUMMARY
+              echo "|repo|RPM|URL|" >> $GITHUB_STEP_SUMMARY
+              echo "|:---|:---|:---|" >> $GITHUB_STEP_SUMMARY
+              awk '{print "|"$1"|"$2"|"$3"|"}' $i >> $GITHUB_STEP_SUMMARY
+            done
+          fi
         fi
 
     - uses: actions/upload-artifact@v7
@@ -171,10 +181,9 @@ jobs:
       if: always()
       with:
         name: all-repo
-        path: all-repo.tar.bz2
+        path: dist/*.tar.bz2
         retention-days: 5
         if-no-files-found: ignore
-        archive: false
 
     # 仅 Build RPMs 且填写 release_tag 才创建草稿Release并上传所有包
     - name: Create Draft Release & Upload All Build Artifacts
@@ -184,9 +193,9 @@ jobs:
         tag_name: ${{ github.event.inputs.custom_branch }}
         name: Release ${{ github.event.inputs.custom_branch }}
         files: |
-          *.tar.bz2
+          dist/*.tar.bz2
         generate_release_notes: true
         draft: true
-        overwrite: true
+        overwrite_files: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

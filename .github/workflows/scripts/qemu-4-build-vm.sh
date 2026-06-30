@@ -139,7 +139,7 @@ function copy_rpms_to_repo {
   # will go in (regular or testing).  Fedora always gets the newest
   # releases, and Alma gets the older releases.
   case $build_host in
-  almalinux*)
+  almalinux*|centos*)
     case $zfs_major in
     2.2)
       d="epel"
@@ -166,7 +166,7 @@ function copy_rpms_to_repo {
   mkdir -p $dst/SRPMS
   cp $(ls *.src.rpm) $dst/SRPMS/
 
-  if [[ "$build_host" =~ "almalinux" ]] ; then
+  if [[ "$build_host" =~ "almalinux"|"centos" ]] ; then
     # Copy kmods+userspace
     mkdir -p $dst/kmod/x86_64/debug
     cp $(ls *.rpm | grep -Ev 'src.rpm|dkms|debuginfo') $dst/kmod/x86_64
@@ -204,9 +204,34 @@ function freebsd() {
   run gmake -j$(nproc)
   echo "##[endgroup]"
 
-  echo "##[group]Install"
-  run sudo gmake install
-  echo "##[endgroup]"
+  if [ -n "$REPO" ] ; then
+    echo "Skipping install since we're only building packages"
+  else
+    echo "##[group]Install"
+    run sudo gmake install
+    echo "##[endgroup]"
+  fi
+
+  if [ -n "$REPO" ] ; then
+    echo "##[group]Repo"
+    freebsd-version > /var/tmp/freebsd-version.txt
+    os_label="freebsd$(cat /var/tmp/freebsd-version.txt | grep -Eo '^[0-9]+\.[0-9]+' | head -1)"
+    prefix=/tmp/repo
+    mkdir -p $prefix/$os_label
+
+    # Build a tarball of the built source tree and copy to repo.
+    # FreeBSD doesn't have RPM/DEB packaging; we ship the configured+build tree.
+    if [ -n "$TARBALL" ] ; then
+      build_tarball
+    fi
+
+    # Copy the built source tree as a tarball for distribution.
+    cd ..
+    tar -czf $prefix/$os_label/zfs-src-built.tar.gz --exclude='.git' zfs/
+    cd zfs
+
+    echo "##[endgroup]"
+  fi
 }
 
 function linux() {
@@ -324,19 +349,34 @@ function deb_build_and_install() {
   echo "##[endgroup]"
 
   echo "##[group]Install"
-  # Do kmod install.  Note that when you build the native debs, the
-  # packages themselves are placed in parent directory '../' rather than
-  # in the source directory like the rpms are.
-  run sudo apt-get -y install $(find ../ | grep -E '\.deb$' \
-    | grep -Ev 'dkms|dracut')
+  if [ -n "$REPO" ] ; then
+    echo "Skipping install since we're only building packages"
+  else
+    # Do kmod install.  Note that when you build the native debs, the
+    # packages themselves are placed in parent directory '../' rather than
+    # in the source directory like the rpms are.
+    run sudo apt-get -y install $(find ../ | grep -E '\.deb$' \
+      | grep -Ev 'dkms|dracut')
+  fi
   echo "##[endgroup]"
+
+  if [ -n "$REPO" ] ; then
+    echo "##[group]Repo"
+    source /etc/os-release
+    os_label="$ID$VERSION_ID"
+    prefix=/tmp/repo
+    mkdir -p $prefix/$os_label
+    # Debs are built in the parent directory (../).
+    cp $(find ../ -maxdepth 1 -name '*.deb' -o -name '*.ddeb' -o -name '*.buildinfo' -o -name '*.changes') $prefix/$os_label/
+    echo "##[endgroup]"
+  fi
 }
 
 function build_tarball {
   if [ -n "$REPO" ] ; then
     ./autogen.sh
     ./configure --with-config=srpm
-    make dist
+    ${MAKE:-make} dist
     mkdir -p /tmp/repo/releases
     # The tarball name is based off of 'Version' field in the META file.
     mv *.tar.gz /tmp/repo/releases/
