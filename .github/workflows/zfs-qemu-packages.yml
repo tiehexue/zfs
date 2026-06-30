@@ -53,6 +53,10 @@ on:
         default: false
         description: "(optional) do version lookup only on repo test"
 
+# 授予创建草稿Release、上传附件权限
+permissions:
+  contents: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -63,12 +67,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ['almalinux8', 'almalinux9', 'almalinux10', 'fedora43', 'fedora44']
+        os: ['ubuntu26', 'almalinux10', 'fedora44', 'debian13']
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v6
       with:
-        ref: ${{ github.event.pull_request.head.sha }}
+        # Always use the current branch's CI scripts, not the custom_branch.
+        # qemu-4-build-vm.sh handles checking out custom_branch on the VM.
+        ref: ${{ github.event.pull_request.head.sha || github.ref }}
+        fetch-depth: 0
 
     - name: Setup QEMU
       run: .github/workflows/scripts/qemu-1-setup.sh
@@ -168,3 +175,18 @@ jobs:
         retention-days: 5
         if-no-files-found: ignore
         archive: false
+
+    # 仅 Build RPMs 且填写 release_tag 才创建草稿Release并上传所有包
+    - name: Create Draft Release & Upload All Build Artifacts
+      if: ${{ github.event.inputs.test_type == 'Build RPMs' && github.event.inputs.custom_branch != '' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.inputs.custom_branch }}
+        name: Release ${{ github.event.inputs.custom_branch }}
+        files: |
+          *.tar.bz2
+        generate_release_notes: true
+        draft: true
+        overwrite: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
