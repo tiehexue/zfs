@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   zloop:
+    if: github.repository == 'openzfs/zfs'
     runs-on: ubuntu-24.04
     env:
       WORK_DIR: /mnt/zloop
