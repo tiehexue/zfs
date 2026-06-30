@@ -47,7 +47,6 @@ while [[ $# -gt 0 ]]; do
       # current (more modern) versions so the subsequent CI steps use those.
       shift
       shift
-      PREV_BRANCH=$(git branch --show-current)
       trap 'cleanup' ERR
       ;;
     --enable-debug)
@@ -389,7 +388,15 @@ if [ -n "$ENABLE_DEBUG" ] ; then
 fi
 
 if [ -n "$CUSTOM_BRANCH" ] ; then
-  git fetch --unshallow
+  # Record the current branch before switching, so the cleanup trap can
+  # restore it if the build fails.
+  PREV_BRANCH=$(git branch --show-current)
+
+  # Only unshallow if the repository was cloned shallowly.
+  if git rev-parse --is-shallow-repository | grep -q true ; then
+    git fetch --unshallow
+  fi
+
   git checkout $CUSTOM_BRANCH
 fi
 
