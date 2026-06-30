@@ -2,15 +2,33 @@
 # 3) Wait for VM to boot from previous step and launch dependencies
 #    script on it.
 #
-# qemu-3-deps.sh [--poweroff] OS_NAME [FEDORA_VERSION]
+# qemu-3-deps.sh [--poweroff] OS_NAME [ARCH] [FEDORA_VERSION]
 #
 # --poweroff: Power off the VM after installing dependencies
 # OS_NAME: OS name (like 'fedora41')
+# ARCH: architecture (x86_64 or aarch64, default x86_64)
 # FEDORA_VERSION: (optional) Experimental Fedora kernel version, like "6.14" to
 #     install instead of Fedora defaults.
 ######################################################################
 
-.github/workflows/scripts/qemu-wait-for-vm.sh vm0
+# Consume --poweroff if present
+POWEROFF=""
+if [ "${1:-}" = "--poweroff" ]; then
+  POWEROFF="--poweroff"
+  shift
+fi
+OS="${1:-}"
+ARCH="${2:-x86_64}"
+# Shift past OS and ARCH so "$@" contains only the optional FEDORA_VERSION
+shift 2 2>/dev/null || true
+
+if [ "$ARCH" = "aarch64" ]; then
+  QEMU_BIN="/usr/bin/qemu-system-aarch64"
+else
+  QEMU_BIN="/usr/bin/qemu-system-x86_64"
+fi
+
+.github/workflows/scripts/qemu-wait-for-vm.sh vm0 $ARCH
 
 # SPECIAL CASE:
 #
@@ -28,9 +46,11 @@ if [[ $ver =~ ^[0-9]+\.[0-9]+ ]] ; then
 fi
 
 scp .github/workflows/scripts/qemu-3-deps-vm.sh zfs@vm0:qemu-3-deps-vm.sh
-PID=`pidof /usr/bin/qemu-system-x86_64`
-ssh zfs@vm0 '$HOME/qemu-3-deps-vm.sh' "$@"
-# wait for poweroff to succeed
-tail --pid=$PID -f /dev/null
+PID=$(pidof $QEMU_BIN || true)
+ssh zfs@vm0 '$HOME/qemu-3-deps-vm.sh' $POWEROFF "$OS" "$@"
+# wait for poweroff to succeed (if we have a valid PID)
+if [ -n "$PID" ]; then
+  tail --pid=$PID -f /dev/null
+fi
 sleep 5 # avoid this: "error: Domain is already active"
 rm -f $HOME/.ssh/known_hosts

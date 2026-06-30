@@ -32,6 +32,22 @@ on:
         options:
         - "Build RPMs"
         - "Test repo"
+      architecture:
+        type: choice
+        required: false
+        default: "x86_64"
+        description: "Build for which architecture?"
+        options:
+        - "x86_64"
+        - "aarch64"
+        - "both"
+      os_selection:
+        type: string
+        required: false
+        default: ""
+        description: |-
+          (optional) Comma-separated OS list (blank = ubuntu26).
+          Available: almalinux8, almalinux9, almalinux10, centos-stream9, centos-stream10, debian11, debian12, debian13, fedora43, fedora44, freebsd14-4r, freebsd15-1r, freebsd15-1s, freebsd16-0c, ubuntu22, ubuntu24, ubuntu26
       patch_level:
         type: string
         required: false
@@ -62,13 +78,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  setup-matrix:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_include: ${{ steps.generate.outputs.matrix_include }}
+    steps:
+      - name: Generate matrix
+        id: generate
+        run: |
+          INPUT_OS='${{ github.event.inputs.os_selection }}'
+          INPUT_ARCH='${{ github.event.inputs.architecture }}'
+
+          # Parse os_selection: comma-separated → JSON array, or default list.
+          # Filter out empty strings from trailing commas.
+          if [ -z "$INPUT_OS" ]; then
+            OS_LIST='["ubuntu26"]'
+          else
+            OS_LIST=$(echo "$INPUT_OS" | sed 's/^[[:space:]"]*//;s/[[:space:]"]*$//' | jq -Rc 'split(",") | map(.|sub("^[[:space:]]+";"")|sub("[[:space:]]+$";"")) | map(select(length > 0))')
+          fi
+          echo "DEBUG: os_list=$OS_LIST"
+
+          # Parse architecture
+          if [ "$INPUT_ARCH" = "both" ]; then
+            ARCH_LIST='["x86_64","aarch64"]'
+          else
+            ARCH_LIST="[\"$INPUT_ARCH\"]"
+          fi
+          echo "DEBUG: arch_list=$ARCH_LIST"
+
+          # Build {os, arch} combinations.  For aarch64, force os=ubuntu24
+          # because builds run directly on the ARM runner, not inside a QEMU VM.
+          INCLUDE=$(jq -nc --argjson os "$OS_LIST" --argjson arch "$ARCH_LIST" '
+            [ $arch[] as $a | $os[] as $o |
+              if $a == "aarch64" then
+                {os: "ubuntu24", arch: $a}
+              else
+                {os: $o, arch: $a}
+              end
+            ] | unique
+          ')
+          echo "matrix_include=$INCLUDE" >> $GITHUB_OUTPUT
+          echo "DEBUG: matrix_include=$INCLUDE"
+
   zfs-qemu-packages-jobs:
     name: qemu-VMs
+    needs: [ setup-matrix ]
     strategy:
       fail-fast: false
       matrix:
-        os: ['ubuntu26', 'almalinux10', 'fedora44', 'debian13', 'centos-stream10', 'freebsd15-1s']
-    runs-on: ubuntu-24.04
+        include: ${{ fromJson(needs.setup-matrix.outputs.matrix_include) }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
     - uses: actions/checkout@v6
       with:
@@ -77,22 +137,39 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || github.ref }}
         fetch-depth: 0
 
+    # ---- x86_64: QEMU VM path ----
     - name: Setup QEMU
+      if: matrix.arch == 'x86_64'
       run: .github/workflows/scripts/qemu-1-setup.sh
 
     - name: Start build machine
-      run: .github/workflows/scripts/qemu-2-start.sh ${{ matrix.os }}
+      if: matrix.arch == 'x86_64'
+      run: .github/workflows/scripts/qemu-2-start.sh ${{ matrix.os }} ${{ matrix.arch }}
 
     - name: Install dependencies
+      if: matrix.arch == 'x86_64'
       run: |
-        .github/workflows/scripts/qemu-3-deps.sh --poweroff ${{ matrix.os }}
+        .github/workflows/scripts/qemu-3-deps.sh --poweroff ${{ matrix.os }} ${{ matrix.arch }}
 
-    - name: Build modules or Test repo
+    # ---- aarch64: direct runner build (no QEMU VM) ----
+    - name: Install dependencies (aarch64)
+      if: matrix.arch == 'aarch64'
+      timeout-minutes: 20
+      run: |
+        .github/workflows/scripts/qemu-3-deps-vm.sh ubuntu24
+        # Running VM scripts directly on the runner requires hostname fixups.
+        for ((i=0; i<=3; i++)); do
+          echo "127.0.0.1 vm$i" | sudo tee -a /etc/hosts
+        done
+
+    # ---- Build (both arches) ----
+    - name: Build modules or Test repo (x86_64)
+      if: matrix.arch == 'x86_64'
       run: |
         set -e
         if [ "${{ github.event.inputs.test_type }}" == "Test repo" ] ; then
                 # Bring VM back up and copy over zfs source
-                .github/workflows/scripts/qemu-prepare-for-build.sh
+                .github/workflows/scripts/qemu-prepare-for-build.sh ${{ matrix.arch }}
 
                 mkdir -p /tmp/repo
                 EXTRA=""
@@ -111,32 +188,55 @@ jobs:
                 fi
 
                 .github/workflows/scripts/qemu-4-build.sh $EXTRA \
-                        --repo --release --dkms --tarball ${{ matrix.os }}
+                        --repo --release --dkms --tarball ${{ matrix.os }} ${{ matrix.arch }}
 
                 if [ -n "${{ github.event.inputs.custom_branch }}" ] ; then
                         echo "Built packages for ${{ github.event.inputs.custom_branch }}"
                 fi
         fi
 
+    - name: Build modules (aarch64)
+      if: matrix.arch == 'aarch64'
+      run: |
+        set -e
+        EXTRA=""
+        if [ -n "${{ github.event.inputs.patch_level }}" ] ; then
+                EXTRA="--patch-level ${{ github.event.inputs.patch_level }}"
+        fi
+        if [ -n "${{ github.event.inputs.custom_branch }}" ] ; then
+                EXTRA+=" --custom-branch ${{ github.event.inputs.custom_branch }}"
+        fi
+
+        .github/workflows/scripts/qemu-4-build-vm.sh $EXTRA \
+                --repo --release --dkms --tarball ubuntu24
+
+        if [ -n "${{ github.event.inputs.custom_branch }}" ] ; then
+                echo "Built packages for ${{ github.event.inputs.custom_branch }}"
+        fi
+
+    # ---- Prepare artifacts (both arches) ----
     - name: Prepare artifacts
       if: always()
       run: |
-        rsync -a zfs@vm0:/tmp/repo /tmp || true
+        if [ "${{ matrix.arch }}" = "x86_64" ]; then
+          rsync -a zfs@vm0:/tmp/repo /tmp || true
+        fi
+        # aarch64: packages are already in /tmp/repo from the direct build.
         .github/workflows/scripts/replace-dupes-with-symlinks.sh /tmp/repo
-        tar -cjf ${{ matrix.os }}-repo.tar.bz2 -C /tmp repo
+        tar -cjf ${{ matrix.os }}-${{ matrix.arch }}-repo.tar.bz2 -C /tmp repo
 
     - uses: actions/upload-artifact@v7
       id: artifact-upload
       if: always()
       with:
-        name: ${{ matrix.os }}-repo
-        path: ${{ matrix.os }}-repo.tar.bz2
+        name: ${{ matrix.os }}-${{ matrix.arch }}-repo
+        path: ${{ matrix.os }}-${{ matrix.arch }}-repo.tar.bz2
         retention-days: 2
         if-no-files-found: ignore
 
   combine_repos:
     if: always()
-    needs: [zfs-qemu-packages-jobs]
+    needs: [setup-matrix, zfs-qemu-packages-jobs]
     name: "Results"
     runs-on: ubuntu-latest
     steps:
