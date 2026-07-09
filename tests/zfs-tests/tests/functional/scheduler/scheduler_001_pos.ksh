@@ -142,8 +142,8 @@ log_assert "Benchmark all 4 vdev scheduler modes (auto/off/on/wronly)"
 
 log_onexit cleanup
 
-if ! is_linux && ! is_freebsd; then
-	log_note "vdev scheduler test requires Linux or FreeBSD"; log_pass
+if ! is_linux; then
+	log_note "vdev scheduler test requires Linux"; log_pass
 fi
 
 log_note "Using fio ioengine: $IOENGINE"
@@ -189,20 +189,11 @@ fi
 # Benchmarks recreate their own pools; this just resets any accumulated
 # kernel-internal counters, slab caches, and vdev state from prior tests.
 destroy_pool $TESTPOOL 2>/dev/null
-if is_linux; then
-	if modprobe -r zfs 2>/dev/null; then
-		log_must modprobe zfs
-		log_note "Reloaded zfs kernel module — clean slate"
-	else
-		log_note "Could not unload zfs module (in use); continuing anyway"
-	fi
-elif is_freebsd; then
-	if kldunload openzfs 2>/dev/null; then
-		log_must kldload openzfs
-		log_note "Reloaded zfs kernel module — clean slate"
-	else
-		log_note "Could not unload zfs module (in use); continuing anyway"
-	fi
+if modprobe -r zfs 2>/dev/null; then
+	log_must modprobe zfs
+	log_note "Reloaded zfs kernel module — clean slate"
+else
+	log_note "Could not unload zfs module (in use); continuing anyway"
 fi
 
 # Workload definitions
