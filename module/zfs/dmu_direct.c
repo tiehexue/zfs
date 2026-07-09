@@ -30,7 +30,7 @@
 #include <sys/dsl_dataset.h>
 #include <sys/dmu_objset.h>
 
-abd_t *
+static abd_t *
 make_abd_for_dbuf(dmu_buf_impl_t *db, abd_t *data, uint64_t offset,
     uint64_t size)
 {
@@ -73,7 +73,7 @@ make_abd_for_dbuf(dmu_buf_impl_t *db, abd_t *data, uint64_t offset,
 	return (mbuf);
 }
 
-void
+static void
 dmu_read_abd_done(zio_t *zio)
 {
 	abd_free(zio->io_abd);
