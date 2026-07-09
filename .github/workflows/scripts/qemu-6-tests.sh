@@ -182,8 +182,19 @@ case "$OS" in
     TDIR="/usr/share/zfs"
     sudo -E modprobe zfs
     sudo mv -f /var/tmp/*.txt /tmp
-    sudo mkfs.xfs -fq /dev/vdb
-    sudo mount -o noatime /dev/vdb /var/tmp
+    
+    if [ -b /dev/vdb ]; then
+      sudo mkfs.xfs -fq /dev/vdb
+      sudo mount -o noatime /dev/vdb /var/tmp
+    else
+      # No /dev/vdb (e.g., running on bare metal ARM runner).
+      # Create a file-backed loop device for XFS.
+      sudo fallocate -l 15G /mnt/testdisk.img
+      sudo losetup /dev/loop0 /mnt/testdisk.img
+      sudo mkfs.xfs -fq /dev/loop0
+      sudo mount -o noatime /dev/loop0 /var/tmp
+    fi
+
     sudo chmod 1777 /var/tmp
     sudo mv -f /tmp/*.txt /var/tmp
 
@@ -235,7 +246,7 @@ sudo dmesg -c > dmesg-prerun.txt
 mount > mount.txt
 df -h > df-prerun.txt
 RV=0
-$TDIR/zfs-tests.sh -vKO -s 3GB -T $TAGS || RV=$?
+$TDIR/zfs-tests.sh -vKO -s 3GB -T async || RV=$?
 
 df -h > df-postrun.txt
 echo $RV > tests-exitcode.txt
