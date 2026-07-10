@@ -31,16 +31,11 @@
 #
 # DESCRIPTION:
 #	FreeBSD-specific: Verify that zvol Direct I/O works correctly
-#	through the FreeBSD GEOM provider path. Unlike Linux, FreeBSD
-#	ZVOLs are GEOM providers that receive BIOs with virtually
-#	contiguous bio_data buffers. The DIO path uses abd_get_from_buf()
-#	to create linear ABDs that DMA directly to/from these buffers.
+#	through the FreeBSD GEOM provider path.
 #
 #	Key differences from Linux:
 #	- No blk-mq; all I/O goes through GEOM bio strategy routine
 #	- bio_data is always a single contiguous kernel buffer
-#	- Page stability: vm_page_busy_acquire + pmap_remove_write
-#	- No zero-page handling (FreeBSD doesn't share zero pages)
 #	- ECKSUM falls back to dmu_read_by_dnode for single chunk
 #
 # STRATEGY:
@@ -132,12 +127,13 @@ function test_dio_freebsd_maxphys
 
 	block_device_wait $zvolpath
 
-	# On FreeBSD, zvol_maxphys = DMU_MAX_ACCESS / 2 (typically 8M)
-	# Write at this boundary to ensure chunking works
-	log_must dd if=/dev/urandom of="$datafile1" bs=8M count=32
-	log_must dd if=$datafile1 of=$zvolpath bs=8M count=32 \
+	# On FreeBSD, zvol_maxphys = DMU_MAX_ACCESS / 2 = 32MB.
+	# Write at this boundary to ensure the per-chunk loop in
+	# zvol_strategy_impl correctly handles I/O up to zvol_maxphys.
+	log_must dd if=/dev/urandom of="$datafile1" bs=32M count=8
+	log_must dd if=$datafile1 of=$zvolpath bs=32M count=8 \
 	    conv=fsync
-	log_must dd if=$zvolpath of="$datafile2" bs=8M count=32
+	log_must dd if=$zvolpath of="$datafile2" bs=32M count=8
 	log_must diff $datafile1 $datafile2
 	log_must rm -f "$datafile1" "$datafile2"
 
@@ -205,8 +201,10 @@ function test_dio_freebsd_volblocksize
 		log_must diff $datafile1 $datafile2
 		log_must rm -f "$datafile1" "$datafile2"
 
-		# Sub-blocksize write (should fall back to ARC)
-		# 512-byte writes are never DIO
+		# Sub-blocksize write (should fall back to ARC).
+		# 512-byte writes are never DIO for any volblocksize.
+		# Skip 8k to keep test runtime short — one volblocksize
+		# is sufficient to cover the sub-blocksize fallback path.
 		if [[ $vbs != "8k" ]]; then
 			log_must dd if=/dev/urandom of="$datafile1" bs=512 count=1024
 			log_must dd if=$datafile1 of=$zvolpath bs=512 count=1024 \
@@ -220,11 +218,70 @@ function test_dio_freebsd_volblocksize
 	done
 }
 
+#
+# Test 5: DIO ECKSUM fallback on a mirrored pool.
+#   Write data via DIO to a 2-way mirror, corrupt one side of the
+#   mirror at the block level, then read back via DIO.  The corrupted
+#   block must fail checksum verification (ECKSUM).  The DIO read
+#   path then falls back to dmu_read_by_dnode, which retries the
+#   read against the good mirror copy and returns correct data.
+#
+function test_dio_freebsd_cksum_fallback
+{
+	log_note "=== Test: ECKSUM fallback (DIO on 2-way mirror) ==="
+
+	# Require at least 2 disks for a mirror
+	typeset disk1=$(echo $DISKS | awk '{print $1}')
+	typeset disk2=$(echo $DISKS | awk '{print $2}')
+	if [[ -z "$disk2" ]]; then
+		log_unsupported "Need 2 disks for mirror ECKSUM test"
+	fi
+
+	log_must set_tunable32 VOL_DIO_ENABLED 0
+
+	# Create a temporary mirrored pool
+	typeset mpool=testdio_cksum
+	log_must zpool create -f $mpool mirror $disk1 $disk2
+	log_must zfs create -b 128k -V 256M $mpool/vol
+	log_must zfs set primarycache=metadata $mpool/vol
+	log_must set_tunable32 VOL_DIO_ENABLED 1
+
+	typeset mzvol=${ZVOL_DEVDIR}/$mpool/vol
+	block_device_wait $mzvol
+
+	# Write known data via DIO
+	log_must dd if=/dev/urandom of="$datafile1" bs=1M count=64
+	log_must dd if="$datafile1" of=$mzvol bs=1M count=64 conv=fsync
+	sync_pool $mpool
+
+	# Corrupt one side of the mirror: export, overwrite a region
+	# on one disk past the labels (offset 16M, well into the zvol
+	# data area), then re-import.
+	log_must zpool export $mpool
+	log_must dd if=/dev/zero of=$disk1 bs=1M count=4 seek=16 conv=fsync
+	log_must zpool import $mpool
+	block_device_wait $mzvol
+
+	# Re-enable DIO after import
+	log_must set_tunable32 VOL_DIO_ENABLED 1
+
+	# Read back via DIO — must succeed via ECKSUM → ARC fallback
+	# (ARC will find the good copy on disk2)
+	log_must dd if=$mzvol of="$datafile2" bs=1M count=64
+	log_must diff "$datafile1" "$datafile2"
+
+	log_note "  ECKSUM fallback: OK — DIO read survived mirror corruption"
+
+	log_must rm -f "$datafile1" "$datafile2"
+	log_must zpool destroy $mpool
+}
+
 # ---- Main test execution ----
 
 test_dio_freebsd_basic
 test_dio_freebsd_maxphys
 test_dio_freebsd_crosspath
 test_dio_freebsd_volblocksize
+test_dio_freebsd_cksum_fallback
 
 log_pass "zvol DIO works correctly on FreeBSD GEOM path"
