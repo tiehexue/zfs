@@ -60,6 +60,7 @@ typeset datafile="$(mktemp -t zvol_nopwrite_data.XXXXXX)"
 
 function cleanup
 {
+	restore_tunable VOL_DIO_ENABLED
 	datasetexists $clone && destroy_dataset $clone
 	datasetexists $origin@snap && zfs destroy $origin@snap
 	datasetexists $origin && destroy_dataset $origin
@@ -70,6 +71,8 @@ log_onexit cleanup
 log_assert "Verify zvol DIO + nopwrite does not panic on cloned zvol"
 
 # Ensure DIO is enabled
+rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
+save_tunable VOL_DIO_ENABLED
 log_must set_tunable32 VOL_DIO_ENABLED 1
 
 # Create origin zvol with nopwrite-compatible properties

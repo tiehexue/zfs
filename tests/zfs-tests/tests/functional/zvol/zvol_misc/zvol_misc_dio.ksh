@@ -60,11 +60,7 @@ typeset zvolpath=${ZVOL_DEVDIR}/$TESTPOOL/$TESTVOL
 
 function cleanup
 {
-	# Reset DIO to default (0) — skip save/restore to avoid stale file issues
-	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 0
-		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
-	fi
+	restore_tunable VOL_DIO_ENABLED
 	rm -f "$datafile1" "$datafile2"
 }
 
@@ -117,53 +113,38 @@ function test_dio_write_read
 }
 
 #
-# Test 2: Verify ARC data size stays low with DIO enabled + primarycache=metadata
+# Test 2: DIO write + read-back integrity.  On Linux the page cache is
+# dropped before the read-back so the read actually reaches the zvol
+# (and therefore the DIO read path) instead of being served from cache.
+# ARC data size is logged for information only: with primarycache=metadata
+# data blocks are never cached regardless of DIO, so it proves nothing,
+# and DIO reads legitimately populate the ARC on cache misses.
 #
 function test_dio_arc_bypass
 {
-	log_note "Testing ARC bypass with DIO enabled"
+	log_note "Testing DIO write/read integrity (read must reach the zvol)"
 
 	log_must set_tunable32 VOL_DIO_ENABLED 1
 	block_device_wait $zvolpath
 
 	typeset arc_before=$(_arc_data_size)
-	if [[ -z "$arc_before" ]]; then
-		log_note "Cannot read ARC stats; skipping ARC bypass check"
-		return
-	fi
 
 	# Write 256MB with DIO
 	log_must dd if=/dev/urandom of="$datafile1" bs=1M count=256
 	log_must dd if=$datafile1 of=$zvolpath bs=1M count=256 \
 	    conv=fsync
 
-	# Read it back
+	# Drop the page cache so the buffered read below goes to the zvol.
+	if is_linux; then
+		sync
+		echo 3 > /proc/sys/vm/drop_caches
+	fi
+	# Read it back (through the zvol DIO read path)
 	log_must dd if=$zvolpath of="$datafile2" bs=1M count=256
-	sync_pool
+	log_must diff $datafile1 $datafile2
 
 	typeset arc_after=$(_arc_data_size)
-
-	log_note "ARC data size before=$arc_before after=$arc_after"
-
-	# With primarycache=metadata and DIO enabled, ARC data_size should
-	# remain near 0.  This is expected — metadata-only caching means
-	# data never enters the ARC, and DIO bypasses it entirely.
-	# Allow some small growth for metadata/indirect blocks.
-	typeset arc_growth=0
-	if [[ -n "$arc_before" && -n "$arc_after" ]]; then
-		arc_growth=$((arc_after - arc_before))
-	fi
-
-	# If ARC data grew by more than 32MB, the bypass may not be working.
-	# This is a soft check — the definitive test is perf profiling.
-	if [[ $arc_growth -gt $((32 * 1048576)) ]]; then
-		log_note "WARNING: ARC data grew by $arc_growth bytes " \
-		    "(> 32MB). DIO may not be bypassing ARC for data."
-	else
-		log_note "ARC data grew by only $arc_growth bytes " \
-		    "(< 32MB threshold). Direct I/O is bypassing ARC for data " \
-		    "— ARC data_size remained nearly flat after 256MB I/O."
-	fi
+	log_note "ARC data size (informational): before=$arc_before after=$arc_after"
 
 	log_must rm -f "$datafile1" "$datafile2"
 }
@@ -282,14 +263,13 @@ function test_dio_fio_verify
 #
 # Test 5: DIO read-after-write coherency — write via DIO, then read back
 #   the same data through both DIO and ARC paths.  Both must return
-#   identical content.  ARC data_size is sampled before and after to
-#   confirm DIO writes do not populate the ARC.
+#   identical content.  ARC data_size is sampled for information only.
 #
 function test_dio_coherency_arc_check
 {
 	typeset fio_out="$TEST_BASE_DIR/fio_dio_coherency.txt"
 
-	log_note "===== DIO coherency + ARC bypass check ====="
+	log_note "===== DIO coherency check ====="
 
 	log_must set_tunable32 VOL_DIO_ENABLED 1
 	block_device_wait $zvolpath
@@ -297,15 +277,13 @@ function test_dio_coherency_arc_check
 	typeset arc_before=$(_arc_data_size)
 	log_note "  ARC data_size before DIO write: $arc_before"
 
-	# Write 256M through DIO — must bypass ARC completely
+	# Write 256M through DIO
 	log_note "  Writing 256M via DIO"
 	log_must dd if=/dev/urandom of="$datafile1" bs=1M count=256
 	log_must dd if=$datafile1 of=$zvolpath bs=1M count=256 conv=fsync
 	sync_pool
 
-	# Read back through DIO — verify data matches via diff, not fio --verify
-	# (dd writes raw data, so fio --verify=crc32c would fail — CRC metadata
-	# is only embedded by fio write-with-verify, not by dd)
+	# Read back through DIO (fio uses properly aligned O_DIRECT buffers).
 	log_note "  Reading back via DIO (direct=1)"
 	log_must fio --name=dio-verify --rw=read --bs=1M \
 	    --filename=$zvolpath --direct=1 --numjobs=1 --iodepth=32 \
@@ -313,7 +291,12 @@ function test_dio_coherency_arc_check
 	typeset dio_rd_iops=$(_fio_parse_iops "$fio_out" "read")
 	typeset dio_rd_bw=$(_fio_parse_bw "$fio_out" "read")
 
-	# Save DIO-read content for comparison
+	# Save DIO-read content for comparison.  Drop the page cache first so
+	# this read also reaches the zvol.
+	if is_linux; then
+		sync
+		echo 3 > /proc/sys/vm/drop_caches
+	fi
 	log_must dd if=$zvolpath of="$datafile2" bs=1M count=256
 	log_must diff $datafile1 $datafile2
 
@@ -333,13 +316,7 @@ function test_dio_coherency_arc_check
 	log_note "  DIO read: ${dio_rd_iops:-?} IOPS, ${dio_rd_bw:-?}"
 	log_note "  ARC read: ${arc_rd_iops:-?} IOPS, ${arc_rd_bw:-?}"
 	log_note "  Data integrity: diff verified OK on both DIO and ARC read paths"
-	if [[ $arc_growth -gt $((8 * 1048576)) ]]; then
-		log_note "  ARC growth: $arc_growth bytes (> 8MB). " \
-		    "DIO may not be fully bypassing ARC."
-	else
-		log_note "  ARC growth: $arc_growth bytes (< 8MB). " \
-		    "DIO bypassed ARC — 256MB written+read, ARC stayed nearly flat."
-	fi
+	log_note "  ARC growth (informational): $arc_growth bytes"
 
 	log_must rm -f "$datafile1" "$datafile2"
 	rm -f "$fio_out"
@@ -453,15 +430,14 @@ function test_dio_random_read
 	rm -f "$fio_out"
 }
 
-#
-# Test 8: With primarycache=all, verify DIO enabled vs disabled ARC behavior.
-#   - DIO disabled: ARC should cache data (data_size grows after read).
-#   - DIO enabled:  ARC should NOT cache data (data_size stays flat).
-# This is the definitive test proving DIO bypasses ARC regardless of cache policy.
+# Test 8: With primarycache=all, compare DIO enabled vs disabled behavior.
+#   ARC data_size is measured for information only — it is not a reliable
+#   proof of ARC bypass because it includes dbuf/metadata accounting and
+#   DIO reads populate the ARC on cache misses.
 #
 function test_dio_arc_controlled
 {
-	log_note "Testing DIO vs ARC with primarycache=all"
+	log_note "Testing DIO vs ARC with primarycache=all (informational)"
 
 	# ---- Phase 1: DIO disabled, ARC should cache data ----
 	log_must set_tunable32 VOL_DIO_ENABLED 0
@@ -494,10 +470,8 @@ function test_dio_arc_controlled
 	fi
 	log_must rm -f "$datafile1" "$datafile2"
 
-	# ---- Phase 2: DIO enabled, ARC should NOT cache data ----
-	# DIO writes at offset 128M.  Afterwards we prove ARC didn't grow
-	# (the definitive test), then do controlled I/O to explain the
-	# ARC-vs-DIO performance trade-off.
+	# ---- Phase 2: DIO enabled ----
+	# DIO writes at offset 128M, then measure ARC growth (informational).
 	log_must set_tunable32 VOL_DIO_ENABLED 1
 
 	typeset arc_before_dio_on=$(_arc_data_size)
@@ -514,12 +488,7 @@ function test_dio_arc_controlled
 	log_note "  DIO ON:  ARC data_size after  I/O = $arc_after_dio_on"
 
 	typeset dio_growth=$((arc_after_dio_on - arc_before_dio_on))
-	if [[ $dio_growth -gt $((8 * 1048576)) ]]; then
-		log_fail "DIO ON: ARC data_size grew by $dio_growth bytes " \
-		    "(> 8MB). DIO is NOT bypassing ARC with primarycache=all!"
-	fi
-	log_note "  DIO ON: ARC data growth = $dio_growth bytes (< 8MB — DIO " \
-	    "bypassed ARC: 64MB written+read, zero data cached)"
+	log_note "  DIO ON: ARC data growth = $dio_growth bytes (informational)"
 
 	# ---- Phase 3: Controlled comparison ----
 	# Goal: prove DIO bypass is real, and show what ARC caching buys.
@@ -531,12 +500,6 @@ function test_dio_arc_controlled
 	#      → reads at offset 0 with DIO=OFF hit ARC (very fast)
 	#      → reads at offset 0 with DIO=ON hit disk (bypass ARC)
 	#
-	# This proves:  DIO prevents ARC caching; ARC helps only for
-	# data that WAS previously cached.  DIO's value is not raw
-	# sequential throughput — it's avoiding ARC pollution, reducing
-	# CPU (no kmem+memcpy), and eliminating ARC lock contention
-	# under concurrent workloads.
-
 	typeset ctrl_fio="$TEST_BASE_DIR/fio_ctrl_out.txt"
 
 	# ---- a) Cold read at DIO-written offset (128M), DIO=ON ----
@@ -593,9 +556,7 @@ function test_dio_arc_controlled
 	log_note "  Warm reads (data IS in ARC from Phase 1):"
 	log_note "    DIO     : ${warm_dio_iops:-?} IOPS, ${warm_dio_bw:-?}  (bypasses ARC, goes to disk)"
 	log_note "    ARC     : ${warm_arc_iops:-?} IOPS, ${warm_arc_bw:-?}  (served from ARC cache)"
-	log_note "  Direct I/O is working: DIO writes/reads bypass ARC completely."
-	log_note "  ARC data_size did not grow with primarycache=all — definitive " \
-	    "proof that DIO prevents ARC pollution."
+	log_note "  DIO and ARC both return identical content."
 
 	rm -f "$ctrl_fio"
 	# Restore primarycache for subsequent tests
@@ -605,8 +566,9 @@ function test_dio_arc_controlled
 
 # ---- Main test execution ----
 
-# Clean up any stale saved tunable from a previous crashed run
+# Save the DIO tunable so cleanup can restore the pre-test value.
 rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
+save_tunable VOL_DIO_ENABLED
 
 # Recreate the zvol optimized for DIO testing.
 # Only destroy/recreate the zvol — do NOT destroy the test pool,

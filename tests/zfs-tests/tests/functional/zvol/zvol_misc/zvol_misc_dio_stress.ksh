@@ -63,18 +63,16 @@ typeset zvolsize=512M
 
 function cleanup
 {
-	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 0
-		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
-	fi
+	restore_tunable VOL_DIO_ENABLED
 }
 
 log_onexit cleanup
 
 log_assert "Stress-test zvol DIO with concurrent mixed I/O paths"
 
-# Clean up any stale saved tunable from a previous crashed run
+# Save the DIO tunable so cleanup can restore the pre-test value.
 rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
+save_tunable VOL_DIO_ENABLED
 
 #
 # Test 1: Concurrent DIO and ARC readers/writers to overlapping regions
@@ -99,32 +97,39 @@ function test_dio_concurrent_mixed
 	    conv=fsync
 
 	# Run concurrent DIO writes + DIO reads + ARC reads to same region
-	# fio will use direct=1 for some jobs and direct=0 for others
+	# fio will use direct=1 for some jobs and direct=0 for others.  The
+	# writer covers the whole 64M region once with crc32c verify headers
+	# (single job with the randommap guarantees full coverage, no
+	# time_based), so the subsequent verify jobs are deterministic:
+	# every block in the region then carries a valid header.
 	log_must fio --name=dio-write --rw=randwrite --bs=128k \
-	    --filename=$zvolpath --direct=1 --numjobs=2 \
+	    --filename=$zvolpath --direct=1 --numjobs=1 \
 	    --iodepth=16 --ioengine=libaio --size=64M \
-	    --verify=crc32c --verify_fatal=1 --do_verify=0 \
-	    --offset=32M --time_based --runtime=30 --group_reporting \
+	    --verify=crc32c --verify_fatal=1 --do_verify=1 \
+	    --verify_state_save=0 \
+	    --offset=32M --group_reporting \
 	    --name=arc-read --rw=randread --bs=128k \
 	    --filename=$zvolpath --direct=0 --numjobs=2 \
 	    --iodepth=16 --ioengine=libaio --size=64M \
-	    --offset=32M --time_based --runtime=30 --group_reporting \
+	    --offset=32M --time_based --runtime=15 --group_reporting \
 	    --name=dio-read --rw=randread --bs=128k \
 	    --filename=$zvolpath --direct=1 --numjobs=2 \
 	    --iodepth=16 --ioengine=libaio --size=64M \
-	    --offset=32M --time_based --runtime=30 --group_reporting
+	    --offset=32M --time_based --runtime=15 --group_reporting
 
 	# Verify the written data via DIO read
-	log_must fio --name=dio-verify --rw=randread --bs=128k \
+	log_must fio --name=dio-verify --rw=read --bs=128k \
 	    --filename=$zvolpath --direct=1 --numjobs=2 \
 	    --iodepth=16 --ioengine=libaio --size=64M \
-	    --verify=crc32c --verify_fatal=1 --offset=32M --group_reporting
+	    --verify=crc32c --verify_fatal=1 --do_verify=1 \
+	    --verify_state_save=0 --offset=32M --group_reporting
 
 	# Verify via ARC read as well
-	log_must fio --name=arc-verify --rw=randread --bs=128k \
+	log_must fio --name=arc-verify --rw=read --bs=128k \
 	    --filename=$zvolpath --direct=0 --numjobs=2 \
 	    --iodepth=16 --ioengine=libaio --size=64M \
-	    --verify=crc32c --verify_fatal=1 --offset=32M --group_reporting
+	    --verify=crc32c --verify_fatal=1 --do_verify=1 \
+	    --verify_state_save=0 --offset=32M --group_reporting
 
 	block_device_wait
 	log_must zfs destroy $TESTPOOL/$TESTVOL
