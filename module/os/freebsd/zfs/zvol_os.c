@@ -893,12 +893,14 @@ zvol_strategy_impl(zv_request_t *zvr)
 		}
 		off += size;
 		resid -= size;
+
 		if (bp->bio_flags & BIO_UNMAPPED) {
-			size_t total = ma_off + size;
-			ma += total >> PAGE_SHIFT;
-			ma_off = total & PAGE_MASK;
+			size_t chunk_off = bp->bio_ma_offset +
+			    (off - bp->bio_offset);
+			ma += chunk_off >> PAGE_SHIFT;
+			ma_off = chunk_off & PAGE_MASK;
 		} else {
-			addr += size;
+			addr = (char *)bp->bio_data + (off - bp->bio_offset);
 		}
 	}
 unlock:
