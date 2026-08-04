@@ -35,8 +35,9 @@
 #
 #	Key differences from Linux:
 #	- No blk-mq; all I/O goes through GEOM bio strategy routine
-#	- bio_data is always a single contiguous kernel buffer
-#	- ECKSUM falls back to dmu_read_by_dnode for single chunk
+#	- BIOs may be mapped (linear bio_data) or unmapped (bio_ma page
+#	  arrays); both are handled by the zvol DIO code
+#	- ECKSUM falls back to dmu_read_by_dnode
 #
 # STRATEGY:
 #	1. Create a zvol (GEOM mode by default on FreeBSD)
@@ -66,10 +67,7 @@ typeset datafile2="$(mktemp -t zvol_misc_dio_fbsd2.XXXXXX)"
 
 function cleanup
 {
-	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 1
-		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
-	fi
+	restore_tunable VOL_DIO_ENABLED
 	rm -f "$datafile1" "$datafile2"
 }
 
@@ -77,8 +75,9 @@ log_onexit cleanup
 
 log_assert "Verify zvol DIO works correctly on FreeBSD GEOM path"
 
-# Clean up any stale saved tunable from a previous crashed run
+# Save the DIO tunable so cleanup can restore the pre-test value.
 rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
+save_tunable VOL_DIO_ENABLED
 
 #
 # Test 1: Basic DIO through GEOM provider

@@ -64,24 +64,20 @@ typeset datafile2="$(mktemp -t zvol_misc_dio_blkmq2.XXXXXX)"
 
 function cleanup
 {
-	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 1
-		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
-	fi
+	restore_tunable VOL_DIO_ENABLED
+	restore_tunable VOL_USE_BLK_MQ
 	rm -f "$datafile1" "$datafile2"
-	# Reset blk-mq to default (enabled on modern kernels)
-	if tunable_exists VOL_USE_BLK_MQ ; then
-		set_tunable32 VOL_USE_BLK_MQ 1
-	fi
 }
 
 log_onexit cleanup
 
 log_assert "Verify zvol DIO works correctly with blk-mq on and off (Linux)"
 
-# Clean up any stale saved tunable from a previous crashed run
+# Save the tunables so cleanup can restore the pre-test values.
 rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
 rm -f $TEST_BASE_DIR/tunable-VOL_USE_BLK_MQ
+save_tunable VOL_DIO_ENABLED
+save_tunable VOL_USE_BLK_MQ
 
 #
 # Main test function — runs DIO write/read/verify under a given blk-mq mode
@@ -105,7 +101,7 @@ function test_dio_blk_mq_mode
 	if tunable_exists VOL_USE_BLK_MQ ; then
 		log_must set_tunable32 VOL_USE_BLK_MQ $blkmq
 		# Need export/import for blk-mq change to take effect
-		log_must zpool export $TESTPOOL
+		log_must_busy zpool export $TESTPOOL
 		log_must zpool import $TESTPOOL
 	else
 		log_note "VOL_USE_BLK_MQ not available (single-queue kernel)"
@@ -139,8 +135,9 @@ function test_dio_blk_mq_mode
 	log_must diff $datafile1 $datafile2
 	log_must rm -f "$datafile1" "$datafile2"
 
-	# Verify ECKSUM fallback: disable DIO, dirty ARC with known data,
-	# then read back with DIO (which may hit ARC-cached data)
+	# DIO read of ARC-cached data: populate the ARC with known data via
+	# the ARC path, then read it back with DIO enabled and verify it is
+	# identical (covers the dmu_read_abd ARC-hit copy path).
 	log_note "  DIO read with ARC-cached data"
 	log_must set_tunable32 VOL_DIO_ENABLED 0
 	log_must dd if=/dev/urandom of="$datafile1" bs=128k count=128

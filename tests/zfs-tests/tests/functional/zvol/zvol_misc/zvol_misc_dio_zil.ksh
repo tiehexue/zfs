@@ -31,17 +31,15 @@
 #
 # DESCRIPTION:
 #	Verify that Direct I/O on zvols interacts correctly with the ZIL
-#	(ZFS Intent Log). Tests sync writes (O_SYNC/O_DSYNC) combined
-#	with DIO, verifies data survives export/import, and ensures the
-#	ZIL correctly replays DIO writes after a simulated crash.
+#	(ZFS Intent Log).  Tests sync writes combined with DIO and a
+#	dedicated SLOG, and verifies the data survives export/import.
 #
 # STRATEGY:
 #	1. Create a zvol with a dedicated SLOG device
 #	2. With DIO enabled, do sync writes (DIO triggered by zvol_dio_enabled)
 #	3. Export/import pool and verify data integrity
 #	4. Test with sync=always and sync=standard
-#	5. Test with different logbias values (latency, throughput)
-#	6. Verify that async writes (no O_SYNC) with DIO also preserve data
+#	5. Verify that DIO writes preserve data across export/import
 #
 
 verify_runnable "global"
@@ -67,9 +65,12 @@ typeset slogdev=$TEST_BASE_DIR/slogdev
 
 function cleanup
 {
-	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 1
-		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
+	restore_tunable VOL_DIO_ENABLED
+	# Remove the test SLOG if it is still attached to the pool, so a
+	# failure in this test cannot break subsequent tests in the group.
+	if poolexists $TESTPOOL && zpool status $TESTPOOL 2>/dev/null | \
+	    grep -q "$slogdev"; then
+		zpool remove $TESTPOOL $slogdev
 	fi
 	rm -f "$datafile1" "$datafile2"
 	rm -f "$slogdev"
@@ -79,8 +80,9 @@ log_onexit cleanup
 
 log_assert "Verify zvol DIO + ZIL interaction preserves data integrity"
 
-# Clean up any stale saved tunable from a previous crashed run
+# Save the DIO tunable so cleanup can restore the pre-test value.
 rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
+save_tunable VOL_DIO_ENABLED
 
 #
 # Test 1: Sync writes with DIO + export/import
@@ -113,7 +115,7 @@ function test_dio_sync_export_import
 	    conv=fsync
 
 	# Export and re-import the pool (simulates clean shutdown)
-	log_must zpool export $TESTPOOL
+	log_must_busy zpool export $TESTPOOL
 	log_must zpool import $TESTPOOL
 
 	block_device_wait $zvolpath
@@ -132,11 +134,11 @@ function test_dio_sync_export_import
 }
 
 #
-# Test 2: DIO writes with O_DSYNC (data integrity sync only)
+# Test 2: DIO writes with a synchronous flush (dd conv=fsync)
 #
 function test_dio_odsync
 {
-	log_note "=== Test: DIO with O_DSYNC writes ==="
+	log_note "=== Test: DIO with synchronous (fsync) writes ==="
 
 	log_must truncate -s 128M $slogdev
 
@@ -153,7 +155,7 @@ function test_dio_odsync
 
 	block_device_wait $zvolpath
 
-	# Write (sync, DIO triggered by zvol_dio_enabled)
+	# Write (fsync, DIO triggered by zvol_dio_enabled)
 	log_must dd if=/dev/urandom of="$datafile1" bs=128k count=512
 	log_must dd if=$datafile1 of=$zvolpath bs=128k count=512 \
 	    conv=fsync
@@ -168,11 +170,11 @@ function test_dio_odsync
 }
 
 #
-# Test 3: Async DIO writes (DIO triggered by zvol_dio_enabled)
+# Test 3: DIO writes with sync=standard (DIO triggered by zvol_dio_enabled)
 #
 function test_dio_async
 {
-	log_note "=== Test: Async DIO writes (DIO enabled, no sync flag) ==="
+	log_note "=== Test: DIO writes, sync=standard ==="
 
 	log_must set_tunable32 VOL_DIO_ENABLED 0
 	if datasetexists $TESTPOOL/$TESTVOL; then
@@ -186,7 +188,7 @@ function test_dio_async
 
 	block_device_wait $zvolpath
 
-	# Write (async, DIO triggered by zvol_dio_enabled)
+	# Write (DIO triggered by zvol_dio_enabled)
 	log_must dd if=/dev/urandom of="$datafile1" bs=1M count=64
 	log_must dd if=$datafile1 of=$zvolpath bs=1M count=64 \
 	    conv=fsync
@@ -227,7 +229,7 @@ function test_dio_sync_always
 	    conv=fsync
 
 	# Export/import
-	log_must zpool export $TESTPOOL
+	log_must_busy zpool export $TESTPOOL
 	log_must zpool import $TESTPOOL
 
 	block_device_wait $zvolpath

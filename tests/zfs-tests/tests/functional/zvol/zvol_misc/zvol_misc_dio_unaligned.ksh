@@ -58,10 +58,7 @@ typeset zvolpath=${ZVOL_DEVDIR}/$TESTPOOL/$TESTVOL
 
 function cleanup
 {
-	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 1
-		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
-	fi
+	restore_tunable VOL_DIO_ENABLED
 	rm -f "$datafile1" "$datafile2"
 }
 
@@ -203,8 +200,9 @@ function test_dio_mixed_paths
 
 # ---- Main test execution ----
 
-# Clean up any stale saved tunable from a previous crashed run
+# Save the DIO tunable so cleanup can restore the pre-test value.
 rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
+save_tunable VOL_DIO_ENABLED
 
 test_dio_unaligned 8k
 test_dio_unaligned 128k

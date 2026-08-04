@@ -75,10 +75,7 @@ typeset datafile2="$(mktemp -t zvol_misc_dio_coher2.XXXXXX)"
 
 function cleanup
 {
-	if tunable_exists VOL_DIO_ENABLED ; then
-		set_tunable32 VOL_DIO_ENABLED 1
-		rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
-	fi
+	restore_tunable VOL_DIO_ENABLED
 	rm -f "$datafile1" "$datafile2"
 }
 
@@ -86,8 +83,9 @@ log_onexit cleanup
 
 log_assert "Verify zvol Direct I/O provides full data coherency"
 
-# Clean up any stale saved tunable from a previous crashed run
+# Save the DIO tunable so cleanup can restore the pre-test value.
 rm -f $TEST_BASE_DIR/tunable-VOL_DIO_ENABLED
+save_tunable VOL_DIO_ENABLED
 
 #
 # Helper: recreate a fresh zvol for a test.  Does NOT destroy the
@@ -123,6 +121,18 @@ function create_data
 }
 
 #
+# Drop the Linux page cache so buffered reads below reach the zvol
+# instead of being served from cache.  No-op on other platforms.
+#
+function drop_cache
+{
+	if is_linux; then
+		sync
+		echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+	fi
+}
+
+#
 # Helper: write data to zvol and read it back, then diff.
 #   $1 = write_bs, $2 = write_count, $3 = write_seek
 #   $4 = read_bs,  $5 = read_count,  $6 = read_skip
@@ -134,6 +144,7 @@ function write_read_diff
 
 	log_must dd if="$datafile1" of=$zvolpath bs=$wbs count=$wcnt \
 	    seek=$wseek conv=fsync 2>/dev/null
+	drop_cache
 	log_must dd if=$zvolpath of="$datafile2" bs=$rbs count=$rcnt \
 	    skip=$rskip 2>/dev/null
 	log_must diff $datafile1 $datafile2
@@ -185,6 +196,7 @@ function test_dio_write_arc_read
 
 	# Now disable DIO and read via ARC
 	log_must set_tunable32 VOL_DIO_ENABLED 0
+	drop_cache
 	log_must dd if=$zvolpath of="$datafile2" bs=$bs count=$count \
 	    2>/dev/null
 	log_must diff $datafile1 $datafile2
@@ -228,6 +240,7 @@ function test_arc_write_dio_read
 
 	# Enable DIO and read back
 	log_must set_tunable32 VOL_DIO_ENABLED 1
+	drop_cache
 	log_must dd if=$zvolpath of="$datafile2" bs=$bs count=$count \
 	    2>/dev/null
 	log_must diff $datafile1 $datafile2
@@ -261,6 +274,7 @@ function test_dio_overwrite
 	    conv=fsync 2>/dev/null
 
 	# Read back and verify initial data
+	drop_cache
 	log_must dd if=$zvolpath of="$datafile2" bs=$bs count=$count \
 	    2>/dev/null
 	log_must diff $datafile1 $datafile2
@@ -273,6 +287,7 @@ function test_dio_overwrite
 	    conv=fsync 2>/dev/null
 
 	# Read back — must get NEW data
+	drop_cache
 	log_must dd if=$zvolpath of="$datafile2" bs=$bs count=$count \
 	    2>/dev/null
 	log_must diff $datafile1 $datafile2
@@ -280,6 +295,7 @@ function test_dio_overwrite
 
 	# Also verify via ARC read (disable DIO)
 	log_must set_tunable32 VOL_DIO_ENABLED 0
+	drop_cache
 	log_must dd if=$zvolpath of="$datafile2" bs=$bs count=$count \
 	    2>/dev/null
 	log_must diff $datafile1 $datafile2
@@ -316,6 +332,7 @@ function test_dio_immediate_coherency
 		    count=$count seek=$seek conv=fsync 2>/dev/null
 
 		# Read back IMMEDIATELY — no sync, no delay
+		drop_cache
 		log_must dd if=$zvolpath of="$datafile2" bs=$bs \
 		    count=$count skip=$seek 2>/dev/null
 		log_must diff $datafile1 $datafile2
@@ -350,7 +367,7 @@ function test_dio_export_import_coherency
 	    conv=fsync 2>/dev/null
 
 	# Export and re-import the pool
-	log_must zpool export $TESTPOOL
+	log_must_busy zpool export $TESTPOOL
 	log_must zpool import $TESTPOOL
 	block_device_wait $zvolpath
 
@@ -358,6 +375,7 @@ function test_dio_export_import_coherency
 	log_must set_tunable32 VOL_DIO_ENABLED 1
 
 	# Read back via DIO
+	drop_cache
 	log_must dd if=$zvolpath of="$datafile2" bs=$bs count=$count \
 	    2>/dev/null
 	log_must diff $datafile1 $datafile2
@@ -365,6 +383,7 @@ function test_dio_export_import_coherency
 
 	# Read back via ARC
 	log_must set_tunable32 VOL_DIO_ENABLED 0
+	drop_cache
 	log_must dd if=$zvolpath of="$datafile2" bs=$bs count=$count \
 	    2>/dev/null
 	log_must diff $datafile1 $datafile2
