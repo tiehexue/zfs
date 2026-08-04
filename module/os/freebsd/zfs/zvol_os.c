@@ -669,86 +669,19 @@ zvol_dio_can_write(zvol_state_t *zv, struct bio *bp,
 }
 
 /*
- * Perform a Direct I/O read on a zvol, bypassing the ARC.
- *
- * For unmapped (scattered) BIOs, creates a scattered ABD from the
- * bio_ma page array for zero-copy DMA directly into consumer pages.
- *
- * For mapped (linear) BIOs, 'buf' points to the current position
- * within bio_data (advanced by the caller's chunking loop).
- * Wraps buf in a linear ABD via abd_get_from_buf() so dmu_read_abd()
- * DMAs straight into the consumer's buffer — no intermediate
- * allocation or copy.  The vdev_geom layer handles physical
- * contiguity internally.
+ * Create an ABD from the current chunk of a BIO, either by referencing
+ * the bio_ma scatter/gather pages (unmapped) or by wrapping the linear
+ * bio_data buffer (mapped).  The resulting ABD allows zero-copy DMA
+ * to/from the consumer's buffer.
  */
-static int
-zvol_dio_read(zvol_state_t *zv, struct bio *bp, void *buf, uint64_t off,
-    size_t size)
+static inline abd_t *
+zvol_abd_from_bio(struct bio *bp, vm_page_t *ma, size_t ma_off,
+    char *addr, size_t size)
 {
-	abd_t *abd;
-	int error;
-
-	if (bp->bio_flags & BIO_UNMAPPED) {
-		abd = abd_alloc_from_pages(bp->bio_ma, bp->bio_ma_offset, size);
-	} else {
-		abd = abd_get_from_buf(buf, size);
-	}
-
-	error = dmu_read_abd(zv->zv_dn, off, size, abd, DMU_DIRECTIO);
-	abd_free(abd);
-	return (error);
-}
-
-/*
- * Perform a Direct I/O write on a zvol, bypassing the ARC.
- *
- * For unmapped (scattered) BIOs, creates a scattered ABD from the
- * bio_ma page array for zero-copy DMA directly from consumer pages.
- *
- * For mapped (linear) BIOs, 'buf' points to the current position
- * within bio_data (advanced by the caller's chunking loop).
- * Wraps buf in a linear ABD via abd_get_from_buf() so the ZIO
- * pipeline reads data straight from the consumer's buffer.  The
- * vdev_geom layer handles physical contiguity by transparently
- * converting to an unmapped BIO when necessary.
- *
- * This is a synchronous write — it waits for the I/O to complete.
- */
-static int
-zvol_dio_write(zvol_state_t *zv, struct bio *bp, void *buf, uint64_t off,
-    size_t size, dmu_tx_t *tx)
-{
-	abd_t *abd;
-	int error;
-
-	if (bp->bio_flags & BIO_UNMAPPED) {
-		abd = abd_alloc_from_pages(bp->bio_ma, bp->bio_ma_offset, size);
-
-		/*
-		 * On amd64 the ZIO pipeline (checksum, RAIDZ AVX2 parity
-		 * generation via abd_iterate_func2) may write to buffer
-		 * pages that share the from_pages ABD's vm_page_t chunks.
-		 * The sf_buf temporary mappings used by abd_iter_map for
-		 * from_pages chunks can fault when the AVX2 parity code
-		 * accesses them.  Copy to a kernel-owned ABD to isolate
-		 * the pipeline from bio page lifetimes.  Other
-		 * architectures do not use the AVX2 RAIDZ math path and
-		 * handle from_pages without faulting. Without this copy,
-		 * refreserv_raidz always panics in abd_return_buf,
-		 * abd_iterate_func2, etc.
-		 */
-#ifdef __amd64__
-		abd_t *src = abd;
-		abd = abd_alloc_for_io(size, B_FALSE);
-		abd_copy(abd, src, size);
-		abd_free(src);
-#endif
-	} else {
-		abd = abd_get_from_buf(buf, size);
-	}
-	error = dmu_write_abd(zv->zv_dn, off, size, abd, DMU_DIRECTIO, tx);
-	abd_free(abd);
-	return (error);
+	if (bp->bio_flags & BIO_UNMAPPED)
+		return (abd_alloc_from_pages(ma, ma_off, size));
+	else
+		return (abd_get_from_buf(addr, size));
 }
 
 static void
@@ -758,13 +691,15 @@ zvol_strategy_impl(zv_request_t *zvr)
 	struct bio *bp;
 	uint64_t off, volsize;
 	size_t resid;
-	char *addr;
 	objset_t *os;
 	zfs_locked_range_t *lr;
 	int error = 0;
 	boolean_t doread = B_FALSE;
 	boolean_t is_dumpified;
 	boolean_t commit;
+	char *addr = NULL;
+	vm_page_t *ma = NULL;
+	size_t ma_off = 0;
 
 	bp = zvr->bio;
 	zv = zvr->zv;
@@ -806,7 +741,6 @@ zvol_strategy_impl(zv_request_t *zvr)
 	os = zv->zv_objset;
 	ASSERT3P(os, !=, NULL);
 
-	addr = bp->bio_data;
 	resid = bp->bio_length;
 
 	if (resid > 0 && off >= volsize) {
@@ -839,8 +773,17 @@ zvol_strategy_impl(zv_request_t *zvr)
 		}
 		goto unlock;
 	}
+
+	if (bp->bio_flags & BIO_UNMAPPED) {
+		ma = bp->bio_ma;
+		ma_off = bp->bio_ma_offset;
+	} else {
+		addr = (char *)bp->bio_data;
+	}
+
 	while (resid != 0 && off < volsize) {
 		size_t size = MIN(resid, zvol_maxphys);
+
 		if (doread) {
 			/*
 			 * Try Direct I/O first for page-aligned reads.
@@ -851,23 +794,30 @@ zvol_strategy_impl(zv_request_t *zvr)
 			boolean_t dio_read_now =
 			    zvol_dio_can_read(bp, off, size);
 			if (dio_read_now) {
-				error = zvol_dio_read(zv, bp, addr, off, size);
+				abd_t *abd = zvol_abd_from_bio(
+				    bp, ma, ma_off, addr, size);
+
+				error = dmu_read_abd(zv->zv_dn, off, size,
+				    abd, DMU_DIRECTIO);
+				abd_free(abd);
 			}
 
 			if (!dio_read_now || error == ECKSUM) {
-				abd_t *tmp = NULL;
 				if (bp->bio_flags & BIO_UNMAPPED) {
-					tmp = abd_alloc_from_pages(
-					    bp->bio_ma,
-					    bp->bio_ma_offset, size);
-					addr = abd_borrow_buf_copy(
-					    tmp, size);
-				}
-				error = dmu_read_by_dnode(zv->zv_dn, off, size,
-				    addr, DMU_READ_PREFETCH);
-				if (bp->bio_flags & BIO_UNMAPPED) {
-					abd_return_buf_copy(tmp, addr, size);
+					abd_t *tmp = abd_alloc_from_pages(
+					    ma, ma_off, size);
+					char *buf = abd_borrow_buf(tmp,
+					    size);
+
+					error = dmu_read_by_dnode(zv->zv_dn,
+					    off, size, buf,
+					    DMU_READ_PREFETCH);
+					abd_return_buf_copy(tmp, buf, size);
 					abd_free(tmp);
+				} else {
+					error = dmu_read_by_dnode(zv->zv_dn,
+					    off, size, addr,
+					    DMU_READ_PREFETCH);
 				}
 			}
 		} else {
@@ -883,8 +833,12 @@ zvol_strategy_impl(zv_request_t *zvr)
 				 * to disk, avoiding the data copy overhead.
 				 */
 				if (zvol_dio_can_write(zv, bp, off, size)) {
-				error = zvol_dio_write(zv, bp, addr, off,
-				    size, tx);
+					abd_t *abd = zvol_abd_from_bio(
+					    bp, ma, ma_off, addr, size);
+
+					error = dmu_write_abd(zv->zv_dn,
+					    off, size, abd, DMU_DIRECTIO, tx);
+					abd_free(abd);
 				} else {
 					error = SET_ERROR(ENOTSUP);
 				}
@@ -896,31 +850,39 @@ zvol_strategy_impl(zv_request_t *zvr)
 					 * scatter pages, borrow a linear
 					 * buffer, write it, then release.
 					 */
-					abd_t *tmp = NULL;
 					if (bp->bio_flags & BIO_UNMAPPED) {
-						tmp = abd_alloc_from_pages(
-						    bp->bio_ma,
-						    bp->bio_ma_offset, size);
-						addr = abd_borrow_buf_copy(
+						abd_t *tmp =
+						    abd_alloc_from_pages(
+						    ma, ma_off, size);
+						char *buf =
+						    abd_borrow_buf_copy(
 						    tmp, size);
-					}
-					dmu_write_by_dnode(zv->zv_dn,
-					    off, size, addr, tx,
-					    DMU_READ_PREFETCH);
-					if (bp->bio_flags & BIO_UNMAPPED) {
-						abd_return_buf(tmp, addr,
+
+						dmu_write_by_dnode(zv->zv_dn,
+						    off, size, buf, tx,
+						    DMU_READ_PREFETCH);
+						abd_return_buf(tmp, buf,
 						    size);
 						abd_free(tmp);
+					} else {
+						dmu_write_by_dnode(zv->zv_dn,
+						    off, size, addr, tx,
+						    DMU_READ_PREFETCH);
 					}
+					/*
+					 * The ARC fallback copied the data
+					 * into the dbuf and cannot fail at
+					 * this point (the transaction was
+					 * already assigned), so the write
+					 * completed and any DIO error no
+					 * longer applies.
+					 */
+					error = 0;
 				}
 
 				zvol_log_write(zv, tx, off, size,
 				    commit);
 				dmu_tx_commit(tx);
-				// clean the error value, ARC is
-				// always correct. dmu_write_by_dnode
-				// returns 0.
-				error = 0;
 			}
 		}
 		if (error) {
@@ -930,8 +892,14 @@ zvol_strategy_impl(zv_request_t *zvr)
 			break;
 		}
 		off += size;
-		addr += size;
 		resid -= size;
+		if (bp->bio_flags & BIO_UNMAPPED) {
+			size_t total = ma_off + size;
+			ma += total >> PAGE_SHIFT;
+			ma_off = total & PAGE_MASK;
+		} else {
+			addr += size;
+		}
 	}
 unlock:
 	zfs_rangelock_exit(lr);
