@@ -235,7 +235,7 @@ zfs_access(znode_t *zp, int mode, int flag, cred_t *cr)
  * following area for how this is handled:
  * zfs_write() -> update_pages()
  */
-static int
+int
 zfs_setup_direct(struct znode *zp, zfs_uio_t *uio, zfs_uio_rw_t rw,
     int *ioflagp)
 {
@@ -314,9 +314,12 @@ out:
  *
  * Side Effects:
  *	inode - atime updated if byte count > 0
+ *
+ * This is the shared body of zfs_read().  The caller is responsible for
+ * entering the filesystem (zfs_enter_verify_zp()/zfs_exit()).
  */
 int
-zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
+zfs_read_impl(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 {
 	(void) cr;
 	int error = 0;
@@ -324,34 +327,32 @@ zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 	boolean_t dio_checksum_failure = B_FALSE;
 
 	zfsvfs_t *zfsvfs = ZTOZSB(zp);
-	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
-		return (error);
 
 	if (zp->z_pflags & ZFS_AV_QUARANTINED) {
-		zfs_exit(zfsvfs, FTAG);
-		return (SET_ERROR(EACCES));
+		error = SET_ERROR(EACCES);
+		goto out_dio;
 	}
 
 	/* We don't copy out anything useful for directories. */
 	if (Z_ISDIR(ZTOTYPE(zp))) {
-		zfs_exit(zfsvfs, FTAG);
-		return (SET_ERROR(EISDIR));
+		error = SET_ERROR(EISDIR);
+		goto out_dio;
 	}
 
 	/*
 	 * Validate file offset
 	 */
 	if (zfs_uio_offset(uio) < (offset_t)0) {
-		zfs_exit(zfsvfs, FTAG);
-		return (SET_ERROR(EINVAL));
+		error = SET_ERROR(EINVAL);
+		goto out_dio;
 	}
 
 	/*
 	 * Fasttrack empty reads
 	 */
 	if (zfs_uio_resid(uio) == 0) {
-		zfs_exit(zfsvfs, FTAG);
-		return (0);
+		error = 0;
+		goto out_dio;
 	}
 
 #ifdef FRSYNC
@@ -368,10 +369,8 @@ zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 	if (zfsvfs->z_log &&
 	    (frsync || zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)) {
 		error = zil_commit(zfsvfs->z_log, zp->z_id);
-		if (error != 0) {
-			zfs_exit(zfsvfs, FTAG);
-			return (error);
-		}
+		if (error != 0)
+			goto out_dio;
 	}
 
 	/*
@@ -393,9 +392,11 @@ zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 	/*
 	 * Setting up Direct I/O if requested.
 	 */
-	error = zfs_setup_direct(zp, uio, UIO_READ, &ioflag);
-	if (error) {
-		goto out;
+	if (!(uio->uio_extflg & UIO_DIRECT)) {
+		error = zfs_setup_direct(zp, uio, UIO_READ, &ioflag);
+		if (error) {
+			goto out;
+		}
 	}
 
 #if defined(__linux__)
@@ -534,6 +535,25 @@ out:
 		zfs_uio_free_dio_pages(uio, UIO_READ);
 
 	ZFS_ACCESSTIME_STAMP(zfsvfs, zp);
+	return (error);
+
+out_dio:
+	if (uio->uio_extflg & UIO_DIRECT)
+		zfs_uio_free_dio_pages(uio, UIO_READ);
+	return (error);
+}
+
+int
+zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
+{
+	zfsvfs_t *zfsvfs = ZTOZSB(zp);
+	int error;
+
+	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
+		return (error);
+
+	error = zfs_read_impl(zp, uio, ioflag, cr);
+
 	zfs_exit(zfsvfs, FTAG);
 	return (error);
 }
