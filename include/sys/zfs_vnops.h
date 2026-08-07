@@ -33,7 +33,14 @@ extern int zfs_bclone_enabled;
 
 extern int zfs_fsync(znode_t *, int, cred_t *);
 extern int zfs_read(znode_t *, zfs_uio_t *, int, cred_t *);
+extern int zfs_read_impl(znode_t *, zfs_uio_t *, int, cred_t *);
 extern int zfs_write(znode_t *, zfs_uio_t *, int, cred_t *);
+
+/*
+ * Exported for async direct io in zpl.
+ */
+extern int zfs_setup_direct(struct znode *, zfs_uio_t *, zfs_uio_rw_t, int *);
+
 extern int zfs_holey(znode_t *, ulong_t, loff_t *);
 extern int zfs_access(znode_t *, int, int, cred_t *);
 extern int zfs_clone_range(znode_t *, uint64_t *, znode_t *, uint64_t *,
