@@ -225,6 +225,7 @@ typedef struct zpl_async_read_io {
 	int		ioflag;
 	cred_t		*cr;
 	ssize_t		count;
+	struct zpl_async_read_io *next;	/* lock-free queue link */
 } zpl_async_read_io_t;
 
 static kmem_cache_t *zpl_async_read_io_cache;
@@ -239,6 +240,52 @@ static unsigned int zfs_async_read_task_depth = 4;
 module_param(zfs_async_read_task_depth, uint, 0644);
 MODULE_PARM_DESC(zfs_async_read_task_depth,
 	"Number of threads in the async read taskq");
+
+/*
+ * Per-worker lock-free request queues between the VFS read submission path
+ * and the async read worker threads.
+ *
+ * Each worker owns an intrusive lock-free stack (a Treiber stack) of
+ * requests.  The hot submission path is lock-free: a producer publishes a
+ * request with a single compare-and-swap on the worker's stack head and --
+ * only if the worker is parked -- signals its cv.  A worker drains its whole
+ * stack with one atomic exchange, processes the requests, and parks on its
+ * cv when the stack is empty.  Submission cost is therefore a single
+ * uncontended CAS: no mutex, no irq-safe spinlock, no per-request entry
+ * allocation, and no waitqueue wake on the common path, while the read is
+ * still handed to a worker thread so the submitting thread can return
+ * -EIOCBQUEUED at once.
+ *
+ * Per-worker queues (rather than one shared queue) also eliminate the
+ * single-lock contention seen with a shared channel when many submitting
+ * threads enqueue at once: producers hash to a worker, so pushes hit
+ * different cachelines and only contend when many threads target the same
+ * worker.
+ *
+ * Parking is the only path that takes a lock.  The parked flag is set by
+ * the worker and its stack re-checked after an smp_mb(); the producer's CAS
+ * is a full barrier before the parked flag is read.  A producer that pushes
+ * while the worker is busy never wakes it (the worker re-checks its stack
+ * after every request); a producer that pushes while the worker is parked
+ * sees the flag and wakes it.  A push can therefore never be lost between
+ * the two checks.
+ *
+ * Requests are processed in FIFO (submission) order: the worker drains the
+ * LIFO stack with one exchange and reverses the batch before processing.
+ * The stack is unbounded, so in-flight memory is bounded by the number of
+ * outstanding requests the application keeps (its iodepth), as with any
+ * async I/O queue.
+ */
+typedef struct zpl_async_read_worker {
+	uint64_t	q_top;		/* lock-free stack head (aio pointers) */
+	kmutex_t	q_park_lock;	/* protects parking (cold path only) */
+	kcondvar_t	q_park_cv;	/* park here when the stack is empty */
+	uint64_t	q_parked;	/* 1 while parked on q_park_cv */
+} zpl_async_read_worker_t;
+
+static zpl_async_read_worker_t *zpl_async_read_workers;
+static unsigned int zpl_async_read_nworkers;
+static boolean_t zpl_async_read_stop;
 
 /*
  * Async read in-flight accounting.
@@ -293,6 +340,127 @@ zpl_async_read_task(void *arg)
 	zpl_async_read_rele(aio->zfsvfs);
 	crfree(aio->cr);
 	kmem_cache_free(zpl_async_read_io_cache, aio);
+}
+
+/*
+ * Consumer side of the async read queues.  Runs forever on a
+ * "zpl_async_read" taskq thread: drain the whole stack with one atomic
+ * exchange, run the shared zfs_read_impl() and signal completion for each
+ * request, then loop.  When the stack is empty it parks on the worker's cv
+ * until a submitter pushes a request and wakes it (or until shutdown).
+ */
+static void
+zpl_async_read_worker(void *arg)
+{
+	zpl_async_read_worker_t *w = arg;
+
+	for (;;) {
+		zpl_async_read_io_t *aio, *next;
+		uint64_t top;
+
+		/* Drain the whole stack with one atomic exchange. */
+		top = atomic_swap_64(&w->q_top, 0);
+		aio = (zpl_async_read_io_t *)(uintptr_t)top;
+
+		/*
+		 * The drained list is in LIFO (stack) order; reverse it so
+		 * requests are processed in FIFO (submission) order.  The
+		 * worker drains atomically and finishes one batch before
+		 * draining the next, so this yields exact submission order
+		 * across batches as well.
+		 */
+		if (aio != NULL && aio->next != NULL) {
+			zpl_async_read_io_t *prev = NULL;
+
+			while (aio != NULL) {
+				zpl_async_read_io_t *tmp = aio->next;
+				aio->next = prev;
+				prev = aio;
+				aio = tmp;
+			}
+			aio = prev;
+		}
+
+		if (aio == NULL) {
+			/*
+			 * Nothing to do.  Publish the parked flag, then
+			 * re-check the stack and the stop flag.  The memory
+			 * barrier orders the flag store before the re-check:
+			 * a concurrent producer either observes the parked
+			 * flag (and wakes us) or its push is observed by the
+			 * re-check, so a push can never be lost.  The stop
+			 * check runs under q_park_lock so shutdown (which
+			 * sets the flag and broadcasts under the same lock)
+			 * cannot be missed.
+			 */
+			mutex_enter(&w->q_park_lock);
+			atomic_store_64(&w->q_parked, 1);
+			smp_mb();
+			if (atomic_load_64(&w->q_top) != 0) {
+				atomic_store_64(&w->q_parked, 0);
+				mutex_exit(&w->q_park_lock);
+				continue;
+			}
+			if (zpl_async_read_stop) {
+				atomic_store_64(&w->q_parked, 0);
+				mutex_exit(&w->q_park_lock);
+				return;
+			}
+			cv_wait(&w->q_park_cv, &w->q_park_lock);
+			mutex_exit(&w->q_park_lock);
+			atomic_store_64(&w->q_parked, 0);
+			continue;
+		}
+
+		while (aio != NULL) {
+			next = aio->next;
+			zpl_async_read_task(aio);
+			aio = next;
+		}
+	}
+}
+
+/*
+ * Select the worker that will own a request.  Hashing the kiocb pointer
+ * spreads requests across the workers' cachelines without any shared state.
+ */
+static zpl_async_read_worker_t *
+zpl_async_read_worker_for(struct kiocb *kiocb)
+{
+	uint64_t hash = (uintptr_t)kiocb * 0x9E3779B97F4A7C15ull;
+
+	/*
+	 * Use the high bits of the hash: kiocb pointers are slab aligned,
+	 * so the low bits of the product carry no entropy and would map
+	 * every request to the same worker.
+	 */
+	return (&zpl_async_read_workers[(hash >> 32) %
+	    zpl_async_read_nworkers]);
+}
+
+/*
+ * Producer side: publish a prepared request on a worker's lock-free stack.
+ * One CAS; the worker is woken only if it is actually parked.  Never fails
+ * and never blocks.
+ */
+static void
+zpl_async_read_push(zpl_async_read_worker_t *w, zpl_async_read_io_t *aio)
+{
+	uint64_t top;
+
+	do {
+		top = atomic_load_64(&w->q_top);
+		aio->next = (zpl_async_read_io_t *)(uintptr_t)top;
+	} while (atomic_cas_64(&w->q_top, top,
+	    (uint64_t)(uintptr_t)aio) != top);
+
+	/*
+	 * The CAS is a full barrier: the request is globally visible before
+	 * the parked flag is checked.  Wake only a parked worker; a busy one
+	 * picks the request up when it drains its stack.
+	 */
+	if (atomic_load_64(&w->q_parked) != 0)
+		cv_signal(&w->q_park_cv);
 }
 
 /*
@@ -365,15 +533,7 @@ zpl_async_read_queue(struct kiocb *kiocb, struct iov_iter *to, ssize_t count)
 	}
 
 	zpl_async_read_hold(zfsvfs);
-	if (taskq_dispatch(zpl_async_read_taskq, zpl_async_read_task, aio,
-	    TQ_SLEEP) == TASKQID_INVALID) {
-		zpl_async_read_rele(zfsvfs);
-		zfs_uio_free_dio_pages(&aio->uio, UIO_READ);
-		crfree(aio->cr);
-		kmem_cache_free(zpl_async_read_io_cache, aio);
-		zfs_exit(zfsvfs, FTAG);
-		return (EOPNOTSUPP);
-	}
+	zpl_async_read_push(zpl_async_read_worker_for(aio->kiocb), aio);
 
 	zfs_exit(zfsvfs, FTAG);
 	return (0);
@@ -436,19 +596,59 @@ void
 zpl_async_read_init(void)
 {
 	unsigned int nthreads = MAX(zfs_async_read_task_depth, 1);
+	unsigned int i;
 
 	zpl_async_read_io_cache = kmem_cache_create("zpl_async_read_io",
 	    sizeof (zpl_async_read_io_t), 0,
 	    NULL, NULL, NULL, NULL, NULL, 0);
 
+	/*
+	 * The taskq provides the worker threads; each worker owns a
+	 * lock-free request stack (not the taskq) as its queue.  One
+	 * long-running worker task is dispatched per thread; each consumes
+	 * its own stack and parks on its cv when empty.
+	 */
+	zpl_async_read_nworkers = nthreads;
+	zpl_async_read_workers = kmem_zalloc(nthreads *
+	    sizeof (zpl_async_read_worker_t), KM_SLEEP);
+	for (i = 0; i < nthreads; i++) {
+		mutex_init(&zpl_async_read_workers[i].q_park_lock, NULL,
+		    MUTEX_DEFAULT, NULL);
+		cv_init(&zpl_async_read_workers[i].q_park_cv, NULL,
+		    CV_DEFAULT, NULL);
+		zpl_async_read_workers[i].q_top = 0;
+		zpl_async_read_workers[i].q_parked = 0;
+	}
+	zpl_async_read_stop = B_FALSE;
+
 	zpl_async_read_taskq = taskq_create("zpl_async_read",
 	    nthreads, maxclsyspri, nthreads, INT_MAX, TASKQ_PREPOPULATE);
+	for (i = 0; i < nthreads; i++) {
+		VERIFY3U(taskq_dispatch(zpl_async_read_taskq,
+		    zpl_async_read_worker, &zpl_async_read_workers[i],
+		    TQ_SLEEP), !=, TASKQID_INVALID);
+	}
 }
 
 void
 zpl_async_read_fini(void)
 {
+	unsigned int i;
+
 	if (zpl_async_read_taskq != NULL) {
+		/*
+		 * Wake every parked worker so it can observe the stop flag
+		 * and exit; taskq_destroy() then joins them.  The stop flag
+		 * is set and checked under each worker's park lock, so a
+		 * worker about to park cannot miss it.
+		 */
+		for (i = 0; i < zpl_async_read_nworkers; i++) {
+			mutex_enter(&zpl_async_read_workers[i].q_park_lock);
+			zpl_async_read_stop = B_TRUE;
+			cv_broadcast(&zpl_async_read_workers[i].q_park_cv);
+			mutex_exit(&zpl_async_read_workers[i].q_park_lock);
+		}
+
 		taskq_destroy(zpl_async_read_taskq);
 		zpl_async_read_taskq = NULL;
 	}
@@ -456,6 +656,16 @@ zpl_async_read_fini(void)
 		kmem_cache_destroy(zpl_async_read_io_cache);
 		zpl_async_read_io_cache = NULL;
 	}
+	for (i = 0; i < zpl_async_read_nworkers; i++) {
+		cv_destroy(&zpl_async_read_workers[i].q_park_cv);
+		mutex_destroy(&zpl_async_read_workers[i].q_park_lock);
+	}
+	if (zpl_async_read_workers != NULL) {
+		kmem_free(zpl_async_read_workers,
+		    zpl_async_read_nworkers * sizeof (zpl_async_read_worker_t));
+		zpl_async_read_workers = NULL;
+	}
+	zpl_async_read_nworkers = 0;
 }
 
 static inline ssize_t
