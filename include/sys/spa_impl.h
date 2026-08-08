@@ -495,6 +495,15 @@ struct spa {
 	spa_condense_stat_t	spa_condense_stats[SPA_CONDENSE_TYPES];
 	kmutex_t		spa_condense_stats_lock;
 
+#if defined(__linux__)
+	/*
+	 * Per-pool async Direct I/O worker pool (zpl_async_dio_pool_t *),
+	 * shared by reads and writes and by all datasets of the pool, created
+	 * lazily on the first async request and destroyed in spa_remove().
+	 */
+	void			*spa_zpl_async_dio_pool;
+#endif
+
 #ifdef ZFS_DEBUG
 	/* see spa_condense_debug_task() */
 	taskqid_t	spa_condense_debug_tqid;
