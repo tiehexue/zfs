@@ -46,6 +46,20 @@
 #include <linux/pagemap.h>
 #include <linux/mman.h>
 
+#ifdef ZFS_DEBUG
+/*
+ * Count of read copies served through the pinned-page branch of
+ * zfs_uiomove_iter() (pages pinned by the async Direct I/O submission but
+ * the data copied through the ARC).  Debug builds only; writable so tests
+ * can reset it to verify the branch is exercised.
+ */
+static unsigned long zfs_async_read_pinned_copies = 0;
+module_param(zfs_async_read_pinned_copies, ulong, 0644);
+MODULE_PARM_DESC(zfs_async_read_pinned_copies,
+	"Number of read copies into pre-pinned pages (async DIO ARC fallback); "
+	"debug builds only, writable to reset for testing");
+#endif
+
 /*
  * Move "n" bytes at byte address "p"; "rw" indicates the direction
  * of the move, and the I/O parameters are provided in "uio", which is
@@ -227,10 +241,51 @@ zfs_uiomove_iter(void *p, size_t n, zfs_uio_rw_t rw, zfs_uio_t *uio,
 	size_t oldcnt = cnt;
 	int error = 0;
 
-	if (rw == UIO_READ)
-		cnt = copy_to_iter(p, cnt, uio->uio_iter);
-	else
-		cnt = copy_from_iter(p, cnt, uio->uio_iter);
+	/*
+	 * If the uio has pages pinned by the async Direct I/O submission but
+	 * the request is being served through the ARC (UIO_DIRECT cleared by
+	 * a read-time eligibility decline, the page-unaligned tail, or the
+	 * checksum retry), copy into the pinned pages directly rather than
+	 * through the user virtual addresses.  The taskq thread has no user
+	 * mm, and the pinned pages are guaranteed resident, so the copy can
+	 * never fault.  The pinned pages are the user's buffer pages, so the
+	 * data lands in the same place. EOF tail of an ordinary synchronous
+	 * Direct I/O read reaches this branch too which is also ok.
+	 */
+	if (rw == UIO_READ && uio->uio_dio.pages != NULL &&
+	    !(uio->uio_extflg & UIO_DIRECT)) {
+		size_t copied = 0;
+
+#ifdef ZFS_DEBUG
+		zfs_async_read_pinned_copies++;
+#endif
+		while (copied < cnt) {
+			size_t rel = uio->uio_loffset + copied -
+			    zfs_uio_soffset(uio);
+			size_t idx = rel >> PAGESHIFT;
+			size_t pgoff = rel & (PAGESIZE - 1);
+			size_t chunk = MIN(cnt - copied, PAGESIZE - pgoff);
+			void *paddr;
+
+			ASSERT3U(idx, <, uio->uio_dio.npages);
+			paddr = zfs_kmap_local(uio->uio_dio.pages[idx]);
+			memcpy((char *)paddr + pgoff, (char *)p + copied,
+			    chunk);
+			zfs_kunmap_local(paddr);
+			copied += chunk;
+		}
+		cnt = copied;
+	} else {
+		if (rw == UIO_READ)
+			cnt = copy_to_iter(p, cnt, uio->uio_iter);
+		else
+			cnt = copy_from_iter(p, cnt, uio->uio_iter);
+
+		if (revert)
+			iov_iter_revert(uio->uio_iter, cnt);
+		else if (cnt != oldcnt)
+			error = EFAULT;
+	}
 
 	/*
 	 * When operating on a full pipe no bytes are processed.
@@ -247,11 +302,6 @@ zfs_uiomove_iter(void *p, size_t n, zfs_uio_rw_t rw, zfs_uio_t *uio,
 	 * copies are allowed for both copy and move but EFAULT should
 	 * be returned for zfs_uiomove().
 	 */
-	if (revert)
-		iov_iter_revert(uio->uio_iter, cnt);
-	else if (cnt != oldcnt)
-		error = EFAULT;
-
 	uio->uio_resid -= cnt;
 	uio->uio_loffset += cnt;
 
@@ -656,6 +706,13 @@ zfs_uio_get_dio_pages_alloc(zfs_uio_t *uio, zfs_uio_rw_t rw)
 		}
 
 		vmem_free(uio->uio_dio.pages, size);
+		/*
+		 * Reset the Direct I/O state so uio->uio_dio.pages non-NULL
+		 * reliably means "pages pinned".
+		 */
+		uio->uio_dio.pages = NULL;
+		uio->uio_dio.npages = 0;
+		uio->uio_dio.pinned = B_FALSE;
 		return (error);
 	} else {
 		ASSERT3S(uio->uio_dio.npages, ==, npages);
