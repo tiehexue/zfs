@@ -227,7 +227,7 @@ static kmem_cache_t *zpl_async_dio_io_cache;
 static kmem_cache_t *zpl_async_dio_write_done_cache;
 static kmutex_t zpl_async_dio_pool_lock;
 
-static unsigned int zfs_async_dio_enabled = 0;
+static unsigned int zfs_async_dio_enabled = 1;
 module_param(zfs_async_dio_enabled, uint, 0644);
 MODULE_PARM_DESC(zfs_async_dio_enabled,
 	"Enable async Direct I/O reads and writes");
@@ -238,13 +238,13 @@ MODULE_PARM_DESC(zfs_async_dio_task_depth,
 	"Workers for async Direct I/O per pool; read-only, set "
 	"at module load");
 
-static unsigned long zfs_async_dio_max_inflight = 64 * 1024 * 1024;
+static unsigned long zfs_async_dio_max_inflight = 512 * 1024 * 1024;
 module_param(zfs_async_dio_max_inflight, ulong, 0644);
 MODULE_PARM_DESC(zfs_async_dio_max_inflight,
 	"Maximum bytes of in-flight async Direct I/O (reads and writes) per "
 	"dataset.  The user pages of admitted requests are pinned, so this "
 	"bounds the pinned memory held by queued requests.  Requests beyond "
-	"this limit are served synchronously.  Defaults to 64 MiB");
+	"this limit are served synchronously.  Defaults to 512 MiB");
 
 /*
  * Per-pool (SPA) async Direct I/O worker pool.  One taskq per storage pool,
