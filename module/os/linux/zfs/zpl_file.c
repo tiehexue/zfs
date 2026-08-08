@@ -222,7 +222,7 @@ typedef struct zpl_async_read_io {
 static kmem_cache_t *zpl_async_read_io_cache;
 static kmutex_t zpl_async_read_pool_lock;
 
-static unsigned int zfs_async_dio_enabled = 0;
+static unsigned int zfs_async_dio_enabled = 1;
 module_param(zfs_async_dio_enabled, uint, 0644);
 MODULE_PARM_DESC(zfs_async_dio_enabled,
 	"Enable async Direct I/O reads.  Off by default");
