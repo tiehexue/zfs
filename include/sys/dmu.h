@@ -564,11 +564,15 @@ typedef enum dmu_flags {
 	DMU_PARTIAL_MORE	= 1 << 8, /* Following partial access. */
 	DMU_KEEP_CACHING	= 1 << 9, /* Don't affect caching. */
 	DMU_IS_PREFETCH		= 1 << 10, /* This read is a prefetch. */
+#if defined(__linux__)
+	/* Linux async Direct I/O: issue the read at async priority. */
+	DMU_ASYNC_READ		= 1 << 11, /* Issue at async read priority. */
+#endif
 	/*
 	 * Internal: create cache-miss dbufs "ephemeral" (never published);
 	 * used by the Direct I/O read path so uncached reads skip dn_dbufs_mtx.
 	 */
-	DMU_NO_PUBLISH		= 1 << 11,
+	DMU_NO_PUBLISH		= 1 << 12,
 } dmu_flags_t;
 
 /*
