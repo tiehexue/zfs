@@ -572,6 +572,10 @@ typedef enum dmu_flags {
 	 * entry points that set this flag never do.
 	 */
 	DMU_EPHEMERAL		= 1 << 11,
+#if defined(__linux__)
+	/* Linux async Direct I/O: issue the read at async priority. */
+	DMU_ASYNC_READ		= 1 << 12, /* Issue at async read priority. */
+#endif
 } dmu_flags_t;
 
 /*
