@@ -238,7 +238,7 @@ MODULE_PARM_DESC(zfs_async_dio_task_depth,
 	"Workers for async Direct I/O per pool; read-only, set "
 	"at module load");
 
-static unsigned long zfs_async_dio_max_inflight = 64 * 1024 * 1024;
+static unsigned long zfs_async_dio_max_inflight = 512 * 1024 * 1024;
 module_param(zfs_async_dio_max_inflight, ulong, 0644);
 MODULE_PARM_DESC(zfs_async_dio_max_inflight,
 	"Maximum bytes of in-flight async Direct I/O (reads and writes) per "
