@@ -73,6 +73,23 @@ MODULE_PARM_DESC(zfs_async_write_pinned_copies,
 #endif
 
 /*
+ * Live count of pages currently pinned by pin_user_pages_unlocked() for
+ * Direct I/O: requests pinned at async submission time and requests pinned
+ * during synchronous Direct I/O setup alike.  Incremented for each page
+ * pinned and decremented when unpin_user_pages() releases them, so once all
+ * Direct I/O has completed the value must return to zero; a nonzero value
+ * means pinned pages were leaked.  Updated with the atomic64 operations;
+ * the module parameter exposes a point-in-time read (and a reset for
+ * testing).
+ */
+static unsigned long long zfs_async_dio_pinned_pages = 0;
+module_param(zfs_async_dio_pinned_pages, ullong, 0644);
+MODULE_PARM_DESC(zfs_async_dio_pinned_pages,
+	"Pages currently pinned by Direct I/O (async submissions and sync "
+	"setup); must be zero once all Direct I/O completes; writable to "
+	"reset for testing");
+
+/*
  * Move "n" bytes at byte address "p"; "rw" indicates the direction
  * of the move, and the I/O parameters are provided in "uio", which is
  * update to reflect the data which was moved.  Returns 0 on success or
@@ -575,6 +592,8 @@ zfs_uio_free_dio_pages(zfs_uio_t *uio, zfs_uio_rw_t rw)
 
 	if (uio->uio_dio.pinned) {
 #if defined(HAVE_PIN_USER_PAGES_UNLOCKED)
+		atomic_sub_64(&zfs_async_dio_pinned_pages,
+		    uio->uio_dio.npages);
 		unpin_user_pages(uio->uio_dio.pages, uio->uio_dio.npages);
 #endif
 	} else {
@@ -633,9 +652,11 @@ zfs_uio_pin_user_pages(zfs_uio_t *uio, zfs_uio_rw_t rw)
 			return (SET_ERROR(-res));
 		} else if (len != (res * PAGE_SIZE)) {
 			uio->uio_dio.npages += res;
+			atomic_add_64(&zfs_async_dio_pinned_pages, res);
 			return (SET_ERROR(EFAULT));
 		}
 		uio->uio_dio.npages += res;
+		atomic_add_64(&zfs_async_dio_pinned_pages, res);
 		return (0);
 	}
 #endif
@@ -664,11 +685,13 @@ zfs_uio_pin_user_pages(zfs_uio_t *uio, zfs_uio_rw_t rw)
 			return (SET_ERROR(-res));
 		} else if (amt != (res * PAGE_SIZE)) {
 			uio->uio_dio.npages += res;
+			atomic_add_64(&zfs_async_dio_pinned_pages, res);
 			return (SET_ERROR(EFAULT));
 		}
 
 		len -= amt;
 		uio->uio_dio.npages += res;
+		atomic_add_64(&zfs_async_dio_pinned_pages, res);
 		skip = 0;
 		iovp++;
 	};
@@ -755,6 +778,8 @@ zfs_uio_get_dio_pages_alloc(zfs_uio_t *uio, zfs_uio_rw_t rw)
 	if (error) {
 		if (uio->uio_dio.pinned) {
 #if defined(HAVE_PIN_USER_PAGES_UNLOCKED)
+			atomic_sub_64(&zfs_async_dio_pinned_pages,
+			    uio->uio_dio.npages);
 			unpin_user_pages(uio->uio_dio.pages,
 			    uio->uio_dio.npages);
 #endif
