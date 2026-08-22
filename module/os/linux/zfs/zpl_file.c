@@ -238,13 +238,13 @@ MODULE_PARM_DESC(zfs_async_dio_task_depth,
 	"Workers for async Direct I/O per pool; read-only, set "
 	"at module load");
 
-static unsigned long zfs_async_dio_max_inflight = 50 * 1024 * 1024 * 1024;
+static unsigned long zfs_async_dio_max_inflight = 50ULL * 1024 * 1024 * 1024;
 module_param(zfs_async_dio_max_inflight, ulong, 0644);
 MODULE_PARM_DESC(zfs_async_dio_max_inflight,
 	"Maximum bytes of in-flight async Direct I/O (reads and writes) per "
 	"dataset.  The user pages of admitted requests are pinned, so this "
 	"bounds the pinned memory held by queued requests.  Requests beyond "
-	"this limit are served synchronously.  Defaults to 64 MiB");
+	"this limit are served synchronously.  Defaults to 50 GiB");
 
 /*
  * Per-pool (SPA) async Direct I/O worker pool.  One taskq per storage pool,
@@ -270,33 +270,59 @@ typedef struct zpl_async_dio_pool {
  * (reservation) happens before any user pages are pinned, so the amount of
  * pinned memory held by queued requests is bounded by
  * zfs_async_dio_max_inflight rather than by the queue length.
+ *
+ * The byte count and the teardown draining flag live in one atomic
+ * (z_async_dio_inflight, see zfs_vfsops_os.h), so admission and the
+ * teardown drain synchronize with a single compare-and-swap and the
+ * per-request hot path takes no lock: a kmutex here was the dominant
+ * contended lock (osq_lock spinning) in high-IOPS fio runs.
  */
 static int
 zpl_async_dio_hold(zfsvfs_t *zfsvfs, size_t count)
 {
-	mutex_enter(&zfsvfs->z_async_dio_lock);
-	if (zfsvfs->z_async_dio_draining ||
-	    count > zfs_async_dio_max_inflight ||
-	    zfsvfs->z_async_dio_inflight >
-	    zfs_async_dio_max_inflight - count) {
-		mutex_exit(&zfsvfs->z_async_dio_lock);
-		return (EOPNOTSUPP);
-	}
-	zfsvfs->z_async_dio_inflight += count;
-	mutex_exit(&zfsvfs->z_async_dio_lock);
+	uint64_t cap = MIN((uint64_t)zfs_async_dio_max_inflight,
+	    ZPL_ASYNC_DIO_INFLIGHT_MASK);
+	uint64_t old;
 
-	return (0);
+	if (count > cap)
+		return (EOPNOTSUPP);
+
+	old = atomic_load_64(&zfsvfs->z_async_dio_inflight);
+	for (;;) {
+		if ((old & ZPL_ASYNC_DIO_DRAINING_BIT) != 0 ||
+		    (old & ZPL_ASYNC_DIO_INFLIGHT_MASK) > cap - count)
+			return (EOPNOTSUPP);
+
+		if (atomic_cas_64(&zfsvfs->z_async_dio_inflight, old,
+		    old + count) == old)
+			return (0);
+
+		old = atomic_load_64(&zfsvfs->z_async_dio_inflight);
+	}
 }
 
 static void
 zpl_async_dio_rele(zfsvfs_t *zfsvfs, size_t count)
 {
-	mutex_enter(&zfsvfs->z_async_dio_lock);
-	ASSERT3U(zfsvfs->z_async_dio_inflight, >=, count);
-	zfsvfs->z_async_dio_inflight -= count;
-	if (zfsvfs->z_async_dio_inflight == 0)
+	uint64_t inflight;
+
+	ASSERT3U((atomic_load_64(&zfsvfs->z_async_dio_inflight) &
+	    ZPL_ASYNC_DIO_INFLIGHT_MASK), >=, count);
+
+	inflight = atomic_sub_64_nv(&zfsvfs->z_async_dio_inflight, count);
+
+	/*
+	 * Wake the teardown drainer exactly once, when the last in-flight
+	 * request completes while the filesystem is draining.  The
+	 * broadcast is issued with z_async_dio_lock held, which the
+	 * drainer sleeps on, so the wake cannot be lost between its
+	 * condition check and cv_wait().
+	 */
+	if (inflight == ZPL_ASYNC_DIO_DRAINING_BIT) {
+		mutex_enter(&zfsvfs->z_async_dio_lock);
 		cv_broadcast(&zfsvfs->z_async_dio_cv);
-	mutex_exit(&zfsvfs->z_async_dio_lock);
+		mutex_exit(&zfsvfs->z_async_dio_lock);
+	}
 }
 
 /*
@@ -369,10 +395,10 @@ zpl_async_dio_write_finish(zfsvfs_t *zfsvfs, znode_t *zp, uint64_t zseq,
 	zpl_async_dio_write_insert(&zfsvfs->z_async_dio_write_pending, done);
 	zpl_async_dio_write_advance(&zfsvfs->z_async_dio_write_pending,
 	    &zfsvfs->z_async_dio_write_watermark);
-	ASSERT3U(zfsvfs->z_async_dio_inflight, >=, count);
-	zfsvfs->z_async_dio_inflight -= count;
 	cv_broadcast(&zfsvfs->z_async_dio_cv);
 	mutex_exit(&zfsvfs->z_async_dio_lock);
+
+	zpl_async_dio_rele(zfsvfs, count);
 }
 
 /*
@@ -464,12 +490,20 @@ zpl_async_dio_pool_get(spa_t *spa)
 		 * blocked on transaction assignment, ZIL commits or range
 		 * locks cannot consume every worker and keep queued reads from
 		 * reaching ZIO.
+		 *
+		 * The thread count is fixed.  With TASKQ_DYNAMIC and an
+		 * unbounded maxalloc, taskq_dispatch() spawns a new kthread on
+		 * every submission while all workers are busy, so a deep-queue
+		 * workload (fio numjobs * iodepth) explodes into thousands of
+		 * threads contending on the same locks.  Capping maxalloc at
+		 * the configured depth makes excess requests queue on the
+		 * pending list instead.
 		 */
 		pool->read_taskq = taskq_create(rname, nthreads,
-		    maxclsyspri, nthreads, INT_MAX,
+		    maxclsyspri, nthreads, nthreads,
 		    TASKQ_PREPOPULATE | TASKQ_DYNAMIC);
 		pool->write_taskq = taskq_create(wname, nthreads,
-		    maxclsyspri, nthreads, INT_MAX,
+		    maxclsyspri, nthreads, nthreads,
 		    TASKQ_PREPOPULATE | TASKQ_DYNAMIC);
 		spa->spa_zpl_async_dio_pool = pool;
 	}
