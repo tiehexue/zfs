@@ -232,11 +232,11 @@ module_param(zfs_async_dio_enabled, uint, 0644);
 MODULE_PARM_DESC(zfs_async_dio_enabled,
 	"Enable async Direct I/O reads and writes");
 
-static unsigned int zfs_async_dio_task_depth = 256;
+static unsigned int zfs_async_dio_task_depth = 2048;
 module_param(zfs_async_dio_task_depth, uint, 0444);
 MODULE_PARM_DESC(zfs_async_dio_task_depth,
 	"Worker depth of the per-pool read and write async Direct I/O "
-	"taskqs.  Defaults to 32");
+	"taskqs.  Defaults to 2048");
 
 /*
  * Per-pool (SPA) async Direct I/O worker pool.  One taskq per storage pool,
