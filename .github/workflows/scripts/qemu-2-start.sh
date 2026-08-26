@@ -348,6 +348,7 @@ sudo virt-install \
   --memory $((1024*12)) \
   --memballoon model=virtio \
   --graphics none \
+  --serial file,path=/tmp/vm0-serial.log \
   --network bridge=virbr0,model=$NIC,mac='52:54:00:83:79:00' \
   --cloud-init user-data=/tmp/user-data \
   --disk $DISK,bus=virtio,cache=none,format=raw,driver.discard=unmap \

@@ -13,7 +13,7 @@ else
   QEMU_BIN="/usr/bin/qemu-system-x86_64"
 fi
 
-MAX_WAIT=900  # 15 minutes
+MAX_WAIT=120  # 2 minutes
 START_TIME=$(date +%s)
 
 while pidof $QEMU_BIN >/dev/null; do

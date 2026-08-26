@@ -220,6 +220,15 @@ jobs:
       run: |
         if [ "${{ matrix.arch }}" = "x86_64" ]; then
           rsync -a zfs@vm0:/tmp/repo /tmp || true
+          # Keep the VM's serial console so boot failures can be debugged
+          # (printed as a tail in the build step, full copy shipped here).
+          mkdir -p /tmp/repo
+          sudo cp /tmp/vm0-serial.log /tmp/repo/vm0-serial.log 2>/dev/null || true
+          sudo cp /tmp/vm0-serial-firstboot.log /tmp/repo/vm0-serial-firstboot.log 2>/dev/null || true
+          sudo cp /tmp/vm0-screen.ppm /tmp/repo/vm0-screen.ppm 2>/dev/null || true
+          # QEMU/libvirt writes the serial logs as root with 0600 perms, so
+          # the copies above are root-only; make them readable for the tar.
+          sudo chmod 644 /tmp/repo/vm0-serial.log /tmp/repo/vm0-serial-firstboot.log /tmp/repo/vm0-screen.ppm 2>/dev/null || true
         fi
         # aarch64: packages are already in /tmp/repo from the direct build.
         .github/workflows/scripts/replace-dupes-with-symlinks.sh /tmp/repo

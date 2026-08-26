@@ -325,6 +325,45 @@ EOF
 esac
 echo "##[endgroup]"
 
+# CentOS Stream 10 uses cloud-init's NetworkManager renderer, which does not
+# leave a persistent connection profile.  After 'cloud-init clean' + reboot
+# (this deps step powers off and the build step restarts the VM), the VM
+# boots with no network configuration, never acquires an IP, and SSH times
+# out ("Timed out waiting for VM vm0" in zfs-qemu-packages).  Write a
+# persistent NM keyfile so the interface comes up with DHCP on its own.
+# net.ifnames=0 (set in the kernel cmdline below) makes the NIC eth0 on
+# the next boot.
+case "$1" in
+  centos-stream10)
+    sudo mkdir -p /etc/NetworkManager/system-connections
+    # Match the NIC by MAC address so the profile works no matter what the
+    # interface ends up being named on the next boot (net.ifnames=0 renames
+    # it to eth0, but that rename is not applied if the bootloader ignores
+    # the new kernel cmdline).
+    iface=$(ip -o -4 route show default | awk '{print $5; exit}')
+    [ -z "$iface" ] && iface=$(ls /sys/class/net | grep -v '^lo$' | head -1 || true)
+    mac=$(cat /sys/class/net/$iface/address 2>/dev/null || true)
+    if [ -n "$mac" ]; then
+      sudo tee /etc/NetworkManager/system-connections/eth0.nmconnection >/dev/null <<EOF
+[connection]
+id=eth0
+type=ethernet
+autoconnect=true
+
+[ethernet]
+mac-address=$mac
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+EOF
+      sudo chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection
+    fi
+    ;;
+esac
+
 # Setup Kernel cmdline
 CMDLINE="console=tty0 console=ttyS0,115200n8"
 CMDLINE="$CMDLINE selinux=0"
@@ -337,6 +376,13 @@ case "$1" in
     CMDLINE="$CMDLINE biosdevname=0 net.ifnames=0"
     echo 'GRUB_SERIAL_COMMAND="serial --speed=115200"' \
       | sudo tee -a /etc/default/grub >/dev/null
+    # Force GRUB itself onto the serial console.  The VM has no display, and
+    # without this grub2-mkconfig can emit 'terminal_output gfxterm', which
+    # leaves GRUB stuck before the kernel starts on a headless VM (the
+    # "silent second boot" seen on centos-stream10).
+    sudo sed -i -e '/^GRUB_TERMINAL_INPUT/d' -e '/^GRUB_TERMINAL_OUTPUT/d' /etc/default/grub
+    echo 'GRUB_TERMINAL_INPUT="serial console"' | sudo tee -a /etc/default/grub >/dev/null
+    echo 'GRUB_TERMINAL_OUTPUT="serial console"' | sudo tee -a /etc/default/grub >/dev/null
     ;;
   ubuntu24|ubuntu26)
     GRUB_CFG="/boot/grub/grub.cfg"
@@ -360,6 +406,19 @@ case "$1" in
     echo "GRUB_CMDLINE_LINUX=\"$CMDLINE\"" \
       | sudo tee -a /etc/default/grub >/dev/null
     sudo $GRUB_MKCONFIG -o $GRUB_CFG
+    # RHEL 10 / CentOS Stream 10 uses BLS boot entries: grub2-mkconfig alone
+    # does not propagate GRUB_CMDLINE_LINUX into the entries' 'options' line,
+    # so the new cmdline (console=ttyS0, net.ifnames=0, ...) would silently
+    # not apply on the next boot.  Update the entries directly with grubby.
+    if command -v grubby >/dev/null 2>&1; then
+      sudo grubby --update-kernel=ALL \
+        --remove-args="console selinux random.trust_cpu no_timer_check biosdevname net.ifnames" \
+        --args="$CMDLINE"
+      echo "Updated kernel cmdline in BLS entries:"
+      sudo grubby --info=ALL 2>/dev/null | grep -E '^kernel|^args' || true
+    else
+      echo "grubby not found; relying on grub2-mkconfig only"
+    fi
     echo "##[endgroup]"
     ;;
 esac
