@@ -226,16 +226,16 @@ typedef struct zpl_async_dio_io {
 static kmem_cache_t *zpl_async_dio_io_cache;
 static kmem_cache_t *zpl_async_dio_write_done_cache;
 
-static unsigned int zfs_async_dio_enabled = 0;
+static unsigned int zfs_async_dio_enabled = 1;
 module_param(zfs_async_dio_enabled, uint, 0644);
 MODULE_PARM_DESC(zfs_async_dio_enabled,
 	"Enable async Direct I/O reads and writes");
 
-static unsigned int zfs_async_dio_task_depth = 32;
+static unsigned int zfs_async_dio_task_depth = 2048;
 module_param(zfs_async_dio_task_depth, uint, 0444);
 MODULE_PARM_DESC(zfs_async_dio_task_depth,
 	"Worker depth of the per-pool read and write async Direct I/O "
-	"taskqs.  Defaults to 32");
+	"taskqs.  Defaults to 2048");
 
 /*
  * Per-pool (SPA) async Direct I/O worker pool.  Each pool has a set of
