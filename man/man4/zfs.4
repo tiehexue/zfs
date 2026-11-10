@@ -331,7 +331,7 @@ Default dnode block size as a power of 2.
 .It Sy zfs_default_ibs Ns = Ns Sy 17 Po 128 KiB Pc Pq int
 Default dnode indirect block size as a power of 2.
 .
-.It Sy zfs_async_dio_enabled Ns = Ns Sy 0 Ns | Ns 1 Pq int
+.It Sy zfs_async_dio_enabled Ns = Ns Sy 1 Ns | Ns 0 Pq int
 Enable asynchronous Direct I/O reads.
 When enabled, a read submitted on an asynchronous kiocb (libaio or io_uring)
 has its user pages pinned by the submitting thread and is executed by a
@@ -341,7 +341,7 @@ The pinned pages bound the memory the feature can consume.
 This applies to Direct I/O reads only; writes and buffered reads are not
 affected.
 The default is
-.Sy 0 .
+.Sy 1 .
 .
 .It Sy zfs_async_dio_max_inflight Ns = Pq u64
 Maximum number of bytes of user memory that asynchronous Direct I/O may keep

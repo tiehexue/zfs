@@ -325,7 +325,11 @@ static uint64_t zpl_async_dio_auto_inflight;
  */
 static uint64_t zpl_async_dio_pinned_bytes;
 
-static unsigned int zfs_async_dio_enabled = 0;
+/*
+ * Enabled by default on this branch so CI runs the whole suite through the
+ * async Direct I/O read path.  The upstream default is 0.
+ */
+static unsigned int zfs_async_dio_enabled = 1;
 module_param(zfs_async_dio_enabled, uint, 0644);
 MODULE_PARM_DESC(zfs_async_dio_enabled,
 	"Enable asynchronous Direct I/O reads");
